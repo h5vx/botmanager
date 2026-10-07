@@ -4,6 +4,11 @@
 
 <h1 align="center">botmanager</h1>
 
+<p align="center">
+  <a href="https://github.com/h5vx/botmanager/actions/workflows/docker.yml"><img src="https://github.com/h5vx/botmanager/actions/workflows/docker.yml/badge.svg?event=push" alt="Docker image build"></a>
+  <a href="https://hub.docker.com/r/h5vx/botmanager"><img src="https://img.shields.io/docker/v/h5vx/botmanager?sort=semver&label=docker" alt="Docker Hub"></a>
+</p>
+
 A distributed gateway to the Telegram Bot API. botmanager holds bot
 tokens, runs long polling, sends messages with idempotency guarantees and
 streams incoming events over gRPC, so the rest of your system never talks
@@ -189,12 +194,22 @@ Ports:
 
 ### Docker
 
+Images for `linux/amd64` and `linux/arm64` are published to Docker Hub as
+[`h5vx/botmanager`](https://hub.docker.com/r/h5vx/botmanager) for every
+release tag (`1.2.3`, `1.2`, `1` and `latest`):
+
+```bash
+docker pull h5vx/botmanager:1
+```
+
+Or build it yourself:
+
 ```bash
 docker build -t botmanager .
 ```
 
 ```bash
-docker run --rm -p 9090:9090 -p 9091:9091 -p 9092:9092 -v botmanager-data:/var/lib/botmanager -v "$PWD/certs:/etc/botmanager/certs:ro" -e BOTMANAGER_SECURITY__CERT_FILE=/etc/botmanager/certs/node-1.pem -e BOTMANAGER_SECURITY__KEY_FILE=/etc/botmanager/certs/node-1-key.pem botmanager
+docker run --rm -p 9090:9090 -p 9091:9091 -p 9092:9092 -v botmanager-data:/var/lib/botmanager -v "$PWD/certs:/etc/botmanager/certs:ro" -e BOTMANAGER_SECURITY__CERT_FILE=/etc/botmanager/certs/node-1.pem -e BOTMANAGER_SECURITY__KEY_FILE=/etc/botmanager/certs/node-1-key.pem h5vx/botmanager:1
 ```
 
 The image is distroless and runs as an unprivileged user.

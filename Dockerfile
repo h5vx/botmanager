@@ -4,11 +4,15 @@
 # (никакой оболочки, пакетного менеджера или libc с известными CVE внутри).
 #
 # Билдер закреплён на go 1.25, потому что именно это требует go.mod
-# (сработала MVS-минимальная версия транзитивных зависимостей grpc и
-# prometheus/client_golang на момент написания — см. CLAUDE.md,
-# раздел "Версия Go").
+# (минимум, поднятый транзитивными зависимостями grpc и
+# prometheus/client_golang).
+#
+# Мультиплатформенная сборка (docker buildx --platform linux/amd64,linux/arm64):
+# билдер всегда работает на родной платформе сборочной машины
+# ($BUILDPLATFORM), а бинарь кросс-компилируется под $TARGETOS/$TARGETARCH —
+# без медленной эмуляции QEMU. Без CGO это ничего не стоит.
 
-FROM golang:1.25-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
 
 WORKDIR /src
 
@@ -37,10 +41,17 @@ RUN chmod 755 config && chmod 644 config/*.yaml
 # есть shell) и копируем с --chown в финальный образ, тем же способом ниже.
 RUN mkdir -p /out/data && chmod 755 /out/data
 
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
+ARG TARGETOS=linux
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" \
     -o /out/botmanager ./cmd/botmanager
 
 FROM gcr.io/distroless/static-debian12:nonroot AS final
+
+# Версия попадает в поле version каждой записи лога (observability.version);
+# CI передаёт сюда тег релиза.
+ARG VERSION=dev
+ENV BOTMANAGER_OBSERVABILITY__VERSION=$VERSION
 
 WORKDIR /app
 # --chown обязателен: без него файлы остаются root:root (владелец сборки),
