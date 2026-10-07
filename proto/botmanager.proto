@@ -1,0 +1,483 @@
+// botmanager gRPC contract.
+//
+// botmanager не знает ни о какой предметной области — только о ботах, чатах
+// и сообщениях.
+//
+// Кодогенерация: см. Makefile, таргет `make proto`.
+
+syntax = "proto3";
+
+package botmanager.v1;
+
+option go_package = "github.com/h5vx/botmanager/proto/gen;botmanagerpb";
+
+import "google/protobuf/timestamp.proto";
+
+// ---------------------------------------------------------------------------
+// Общие типы
+// ---------------------------------------------------------------------------
+
+message Empty {}
+
+// Состояние бота: disabled / enabled / broken / deleted.
+enum BotState {
+  BOT_STATE_UNSPECIFIED = 0;
+  BOT_STATE_DISABLED = 1;
+  BOT_STATE_ENABLED = 2;
+  BOT_STATE_BROKEN = 3;
+  BOT_STATE_DELETED = 4;
+}
+
+// Приоритет исходящего сообщения: критичные сообщения обгоняют рутинные
+// при упоре в лимит Telegram.
+enum Priority {
+  PRIORITY_UNSPECIFIED = 0;
+  PRIORITY_NORMAL = 1;
+  PRIORITY_CRITICAL = 2;
+}
+
+// Статус доставки сообщения.
+enum DeliveryStatus {
+  DELIVERY_STATUS_UNSPECIFIED = 0;
+  DELIVERY_STATUS_PENDING = 1;   // принято, ещё не отправлено; retries = 0
+  DELIVERY_STATUS_RETRYING = 2;  // попытка не удалась, запланирован повтор; retries > 0
+  DELIVERY_STATUS_SENT = 3;      // Telegram принял сообщение
+  DELIVERY_STATUS_FAILED = 4;    // терминальный отказ, повторы бессмысленны
+  // Messaging.CancelPending: сообщение было PENDING/RETRYING и отменено
+  // вызывающей стороной до отправки — терминально, но не то же самое,
+  // что FAILED.
+  DELIVERY_STATUS_CANCELLED = 5;
+}
+
+// Класс сбоя, используется в last_error и в событиях состояния.
+enum FailureClass {
+  FAILURE_CLASS_UNSPECIFIED = 0;
+  FAILURE_CLASS_NODE = 1;        // проблема узла: прокси, сеть, DNS
+  FAILURE_CLASS_BOT = 2;         // проблема бота: неверный токен, бот заблокирован в чате
+  FAILURE_CLASS_RATE_LIMIT = 3;  // 429 с retry_after
+  FAILURE_CLASS_RECIPIENT = 4;   // адресат заблокировал бота
+}
+
+// Настройка прокси на уровне бота или узла (значение по умолчанию для
+// узла, переопределение для конкретного бота, отсутствие прокси как явный
+// выбор).
+message ProxyConfig {
+  bool enabled = 1;
+  string address = 2; // socks5h://host:port
+}
+
+message Bot {
+  string id = 1;
+  string display_name = 3;
+  string username = 4;         // для прямой ссылки t.me/<бот>/<приложение>
+  BotState state = 5;
+  ProxyConfig proxy = 6;       // отсутствует поле = использовать умолчание узла
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+  FailureClass last_failure_class = 9; // заполнено, если state == BROKEN
+  string last_failure_reason = 10;
+}
+
+message Chat {
+  int64 chat_id = 1;
+  string title = 2;
+  bool bot_is_member = 3;
+  bool bot_can_pin = 4;
+  bool bot_can_send = 5;
+}
+
+message DeliveryInfo {
+  DeliveryStatus status = 1;
+  int32 retries = 2;
+  string last_error = 3;
+  google.protobuf.Timestamp next_retry_at = 4;
+  google.protobuf.Timestamp sent_at = 5;
+}
+
+message Message {
+  string idempotency_key = 1;
+  string bot_id = 2;
+  int64 chat_id = 3;
+  int64 message_id = 4; // id сообщения в Telegram, известен после SENT
+  string text = 5;
+  DeliveryInfo delivery = 6;
+  Priority priority = 7;
+  google.protobuf.Timestamp created_at = 8;
+}
+
+// ---------------------------------------------------------------------------
+// BotAdmin
+// ---------------------------------------------------------------------------
+
+message CreateBotRequest {
+  string display_name = 1;
+  string token = 2;
+  ProxyConfig proxy = 3;
+}
+
+message UpdateBotRequest {
+  string id = 1;
+  optional string token = 2;
+  optional ProxyConfig proxy = 3;
+  optional string display_name = 4;
+}
+
+message SetBotStateRequest {
+  string id = 1;
+  BotState state = 2; // допустимо ENABLED / DISABLED через этот RPC
+}
+
+message DeleteBotRequest {
+  string id = 1;
+}
+
+message ListBotsRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+}
+
+message BotList {
+  repeated Bot bots = 1;
+  string next_page_token = 2;
+}
+
+message GetBotRequest {
+  string id = 1;
+}
+
+message GetChatRequest {
+  string bot_id = 1;
+  int64 chat_id = 2;
+}
+
+// ListChatsRequest/ChatSummary/ChatList — источник списка чатов для
+// выбора в интерфейсе администратора, вместо ввода chat_id руками.
+message ListChatsRequest {
+  string bot_id = 1;
+}
+
+// ChatSummary — один различный чат из истории сообщений бота. title пуст,
+// если botmanager не смог узнать название (живой вызов getChat не удался
+// или не предпринимался) — тогда вызывающая сторона показывает сам chat_id.
+message ChatSummary {
+  int64 chat_id = 1;
+  string title = 2;
+}
+
+message ChatList {
+  repeated ChatSummary chats = 1;
+}
+
+// VerifyInitData проверяет подпись Telegram Mini App initData целиком
+// внутри botmanager: HMAC-ключ производится от
+// Bot.Token, который наружу не отдаётся (см. Bot и комментарий у
+// botToProto) — поэтому вызывающая сторона присылает сырую строку initData и id
+// бота, а не проверяет подпись сам.
+message VerifyInitDataRequest {
+  string bot_id = 1;
+  string init_data = 2; // сырая query-string из Telegram.WebApp.initData
+  // Допустимый возраст auth_date. 0 = использовать серверное умолчание
+  // (см. CLAUDE.md, раздел "VerifyInitData").
+  int64 max_auth_age_seconds = 3;
+}
+
+// VerifyInitDataResult — результат проверки; никогда не содержит токен
+// бота. Небезопасные (не криптографически подтверждающие личность за
+// пределами самой подписи Telegram) поля разбираются только при valid ==
+// true.
+message VerifyInitDataResult {
+  bool valid = 1;
+  // Причина отказа, когда valid == false: "bad_signature" (подпись не
+  // сошлась или бот не найден/не задан) или "expired" (подпись верна, но
+  // auth_date старше допустимого окна) — см. CLAUDE.md. Пусто
+  // при valid == true.
+  string invalid_reason = 2;
+
+  int64 telegram_user_id = 3;
+  string username = 4;                              // опционально, может отсутствовать в user
+  google.protobuf.Timestamp auth_date = 5;
+  string start_param = 6;                            // start-параметр Mini App
+  // Три состояния, а не bool — поле в user либо
+  // отсутствует (старые клиенты, трактовать как "неизвестно"), либо true,
+  // либо false. optional здесь обязателен: без него false неотличимо от
+  // "поле отсутствует".
+  optional bool allows_write_to_pm = 7;
+}
+
+// GetUserProfilePhoto — аватары пользователей: получение текущей
+// фотографии профиля пользователя Telegram через getUserProfilePhotos +
+// getFile + скачивание файла. Отсутствие фотографии у пользователя — НЕ
+// ошибка, а нормальный ответ (found=false), см. комментарий на результате.
+message GetUserProfilePhotoRequest {
+  string bot_id = 1;
+  int64 user_id = 2;
+}
+
+// found=false, когда у пользователя нет ни одной фотографии профиля —
+// штатный, ожидаемый исход (не codes.NotFound), вызывающая сторона в этом
+// случае показывает свою заглушку.
+message GetUserProfilePhotoResult {
+  bool found = 1;
+  bytes data = 2;          // байты изображения (JPEG от Telegram)
+  string content_type = 3; // например "image/jpeg"
+}
+
+service BotAdmin {
+  rpc CreateBot(CreateBotRequest) returns (Bot);
+  rpc UpdateBot(UpdateBotRequest) returns (Bot);        // токен, прокси, описание
+  rpc SetBotState(SetBotStateRequest) returns (Bot);    // enabled / disabled
+  rpc DeleteBot(DeleteBotRequest) returns (Empty);
+  rpc ListBots(ListBotsRequest) returns (BotList);
+  rpc GetBot(GetBotRequest) returns (Bot);              // username, состояние, здоровье
+  rpc GetChat(GetChatRequest) returns (Chat);           // состоит ли бот, права
+  rpc VerifyInitData(VerifyInitDataRequest) returns (VerifyInitDataResult); // проверка подписи Mini App initData
+  // ListChats — различные чаты из истории сообщений бота,
+  // с человекочитаемой подписью (название чата, если известно, иначе сам
+  // id) — источник выпадающего списка в интерфейсе администратора вместо
+  // ввода chat_id руками.
+  rpc ListChats(ListChatsRequest) returns (ChatList);
+  // GetUserProfilePhoto — текущая фотография профиля пользователя
+  // (аватар), см. комментарии на сообщениях.
+  rpc GetUserProfilePhoto(GetUserProfilePhotoRequest) returns (GetUserProfilePhotoResult);
+}
+
+// ---------------------------------------------------------------------------
+// Messaging
+// ---------------------------------------------------------------------------
+
+// InlineButton — одна кнопка инлайн-клавиатуры. Ровно одно из двух: url
+// (в группах работает обычная URL-кнопка, web_app — нет, поэтому его сюда
+// не добавляем) или callback_data (нажатие приходит в поток Subscribe как
+// callback_query). Оба сразу
+// или ни одного — codes.InvalidArgument на границе gRPC (см.
+// rpcserver/convert.go:buttonsFromProto). callback_data ограничен 64
+// байтами — лимит самого Telegram, проверяется здесь же, а не оставляется
+// на отказ Telegram позже.
+message InlineButton {
+  string text = 1;
+  string url = 2;
+  string callback_data = 3;
+}
+
+message SendRequest {
+  string idempotency_key = 1; // обязателен
+  string bot_id = 2;
+  int64 chat_id = 3;
+  string text = 4;
+  Priority priority = 5;      // critical / normal
+  bool pin = 6;
+  optional int64 reply_to_message_id = 7;
+  // Один ряд инлайн-кнопок под сообщением (без матрицы рядов — не
+  // требуется сегодняшними сценариями). Пусто = без клавиатуры.
+  repeated InlineButton buttons = 8;
+}
+
+message SendAck {
+  string idempotency_key = 1;
+  DeliveryStatus status = 2;
+}
+
+message SendBatchRequest {
+  repeated SendRequest messages = 1;
+}
+
+message SendBatchAck {
+  repeated SendAck acks = 1;
+}
+
+message EditMessageRequest {
+  string idempotency_key = 1; // сообщение, которое редактируем
+  string text = 2;
+}
+
+message DeleteMessageRequest {
+  string idempotency_key = 1;
+}
+
+message PinMessageRequest {
+  string idempotency_key = 1;
+}
+
+message UnpinMessageRequest {
+  string idempotency_key = 1;
+}
+
+message CancelPendingRequest {
+  string idempotency_key = 1; // отменить ещё не отправленное
+}
+
+message CancelAck {
+  string idempotency_key = 1;
+  bool cancelled = 2; // false, если сообщение уже ушло
+}
+
+message AnswerCallbackRequest {
+  string callback_query_id = 1;
+  string text = 2;
+  bool show_alert = 3;
+  // bot_id обязателен: answerCallbackQuery в Telegram Bot API привязан к
+  // конкретному боту (нужен его токен) — callback_query_id сам по себе не
+  // определяет, какой бот его получил.
+  string bot_id = 4;
+}
+
+message GetMessageRequest {
+  string idempotency_key = 1;
+}
+
+message GetMessagesRequest {
+  repeated string idempotency_keys = 1; // пакетно, по ключам
+}
+
+message MessageList {
+  repeated Message messages = 1;
+  string next_page_token = 2;
+}
+
+message ListMessagesRequest {
+  string bot_id = 1;
+  int64 chat_id = 2;         // 0 = без фильтра по чату
+  DeliveryStatus status = 3; // UNSPECIFIED = без фильтра по статусу
+  int32 page_size = 4;
+  string page_token = 5;
+  // Период по created_at, полуоткрытый интервал [created_from, created_to)
+  // (интервалы времени везде полуоткрытые). Фильтрация — в
+  // хранилище botmanager (raftcluster.FSM.ListMessages), НАД полным набором
+  // сообщений бота, а не над уже отданной страницей — иначе
+  // страница с активным периодом могла бы вернуться короче ожидаемого.
+  // Не задано (нулевой Timestamp) = без соответствующей границы.
+  google.protobuf.Timestamp created_from = 6;
+  google.protobuf.Timestamp created_to = 7;
+}
+
+message SubscribeRequest {
+  repeated string bot_ids = 1; // пусто = все боты узла
+}
+
+// Виды обновления в потоке Subscribe (не только входящие сообщения).
+message IncomingMessage {
+  string bot_id = 1;
+  int64 chat_id = 2;
+  int64 message_id = 3;
+  int64 from_user_id = 4;
+  string text = 5;
+  google.protobuf.Timestamp received_at = 6;
+}
+
+message CallbackQuery {
+  string bot_id = 1;
+  string callback_query_id = 2;
+  int64 chat_id = 3;
+  int64 message_id = 4;
+  int64 from_user_id = 5;
+  string data = 6;
+}
+
+message MessageStatusChanged {
+  string idempotency_key = 1;
+  DeliveryInfo delivery = 2;
+}
+
+message ChatMemberChanged {
+  string bot_id = 1;
+  int64 chat_id = 2;
+  bool bot_is_member = 3; // false = бота исключили или он вышел
+}
+
+message BotStateChanged {
+  string bot_id = 1;
+  BotState state = 2;
+  FailureClass failure_class = 3;
+  string reason = 4;
+}
+
+message Update {
+  google.protobuf.Timestamp occurred_at = 1;
+  oneof payload {
+    IncomingMessage incoming_message = 2;
+    CallbackQuery callback_query = 3;
+    MessageStatusChanged message_status_changed = 4;
+    ChatMemberChanged chat_member_changed = 5;
+    BotStateChanged bot_state_changed = 6;
+  }
+}
+
+service Messaging {
+  rpc Send(SendRequest) returns (SendAck);              // idempotency_key обязателен
+  rpc SendBatch(SendBatchRequest) returns (SendBatchAck);
+  rpc EditMessage(EditMessageRequest) returns (SendAck);
+  rpc DeleteMessage(DeleteMessageRequest) returns (Empty);
+  rpc PinMessage(PinMessageRequest) returns (Empty);
+  rpc UnpinMessage(UnpinMessageRequest) returns (Empty);
+  rpc CancelPending(CancelPendingRequest) returns (CancelAck);   // отменить неотправленное
+  rpc AnswerCallback(AnswerCallbackRequest) returns (Empty);
+  rpc GetMessage(GetMessageRequest) returns (Message);
+  rpc GetMessages(GetMessagesRequest) returns (MessageList);     // пакетно, по ключам
+  rpc ListMessages(ListMessagesRequest) returns (MessageList);   // история, фильтры
+  rpc Subscribe(SubscribeRequest) returns (stream Update);
+}
+
+// ---------------------------------------------------------------------------
+// Maintenance
+// ---------------------------------------------------------------------------
+
+// Состояние одного узла кластера.
+message NodeStatus {
+  string node_id = 1;
+  bool is_leader = 2;
+  bool reachable = 3;
+  bool proxy_healthy = 4; // здоровье прокси проверяется отдельно от Telegram
+}
+
+message ClusterStatus {
+  string leader_id = 1;
+  repeated NodeStatus nodes = 2;
+  repeated Bot bots = 3; // состояние и здоровье каждого бота, для страницы статуса
+}
+
+message ExportStateRequest {}
+
+message Chunk {
+  bytes data = 1;
+}
+
+// TransferLeadershipRequest — вывести узел на обслуживание,
+// назначив мастером конкретный другой узел, не дожидаясь штатных выборов.
+message TransferLeadershipRequest {
+  string target_node_id = 1;
+}
+
+// PingTelegramRequest — проверка доступности Telegram
+// API со стороны botmanager. bot_id пуст = прямой канал по умолчанию
+// (умолчание прокси узла, без токена конкретного бота); непустой bot_id =
+// канал этого бота (его собственный токен и эффективный прокси).
+message PingTelegramRequest {
+  string bot_id = 1;
+}
+
+// PingResult — результат PingTelegram. proxy_used — адрес прокси БЕЗ
+// учётных данных (секреты прокси наружу не отдаются), пусто
+// если прокси не использовался.
+message PingResult {
+  bool success = 1;
+  int64 latency_ms = 2;
+  int32 http_status = 3;
+  string proxy_used = 4;
+  string error = 5;
+}
+
+service Maintenance {
+  rpc GetClusterStatus(Empty) returns (ClusterStatus);  // лидер, узлы, здоровье
+  rpc ExportState(ExportStateRequest) returns (stream Chunk);  // для резервной копии
+  // TransferLeadership назначает мастером конкретный узел
+  // поверх штатной передачи лидерства Raft (RaftCluster.LeadershipTransferToServer),
+  // не самодельных выборов. NOT_FOUND — узел неизвестен кластеру,
+  // FAILED_PRECONDITION — вызов пришёл не на лидера (с указанием текущего
+  // лидера), UNAVAILABLE — передача не удалась.
+  rpc TransferLeadership(TransferLeadershipRequest) returns (ClusterStatus);
+  // PingTelegram проверяет доступность Telegram API со стороны botmanager,
+  // в том числе через настроенный прокси — отвечает на
+  // вопрос "это у нас сеть или у Telegram". Таймаут —
+  // CLAUDE.md, раздел "PingTelegram".
+  rpc PingTelegram(PingTelegramRequest) returns (PingResult);
+}

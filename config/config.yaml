@@ -1,0 +1,62 @@
+# Конфигурация botmanager.
+#
+# Любое значение здесь переопределяется переменной окружения с префиксом
+# BOTMANAGER_, вложенность отделяется "__". Пример: чтобы поменять
+# grpc.listen_addr, задать BOTMANAGER_GRPC__LISTEN_ADDR.
+#
+# Секретов (токены ботов) в этом файле нет и не будет — токены передаются
+# через BotAdmin.CreateBot/UpdateBot и хранятся в состоянии Raft, а не в
+# статическом конфиге узла.
+
+node:
+  id: node-1
+  data_dir: /var/lib/botmanager
+  # Порт Raft-транспорта (internal/raftcluster) — отдельный от grpc.listen_addr
+  # (:9090) и http.listen_addr (:9091). 127.0.0.1, а не 0.0.0.0: hashicorp/raft
+  # использует этот же адрес и для advertise (адреса, по которому другие узлы
+  # набирают этот узел), а 0.0.0.0 как advertise-адрес raft отвергает
+  # ("local bind address is not advertisable"). На одноузловом кластере
+  # (см. CLAUDE.md) узлу не нужно быть доступным снаружи;
+  # реальный многоузловой деплой должен будет заменить это на реальный
+  # маршрутизируемый адрес узла.
+  raft_bind_addr: "127.0.0.1:9092"
+
+# Настройки Raft-кластера этого узла (internal/raftcluster).
+raft:
+  # Сколько последних сообщений хранить на каждого бота — retention по
+  # числу записей, не по времени (журнал реплицируется через Raft и живёт
+  # в памяти каждого узла + в каждом снимке, см. package doc
+  # internal/raftcluster/doc.go).
+  message_retention_per_bot: 500
+  # Бутстрапить новый кластер на этом узле, если у него ещё нет состояния
+  # Raft. Безопасно оставлять true между перезапусками.
+  bootstrap: true
+
+grpc:
+  listen_addr: ":9090"
+
+http:
+  listen_addr: ":9091"
+
+# Прокси по умолчанию для узла. Каждый бот может
+# переопределить это значение или явно отключить прокси через UpdateBot.
+proxy:
+  enabled: false
+  address: ""
+
+telegram:
+  request_timeout_seconds: 10
+  long_poll_timeout_seconds: 30
+  # Сколько раз повторить отправку сообщения (проблема узла/неизвестная
+  # ошибка) прежде чем статус доставки станет FAILED.
+  max_send_retries: 10
+  # Как часто раннер проверяет очередь исходящих сообщений в фоне —
+  # подстраховка поверх немедленного пробуждения по SubscribeApplied.
+  send_poll_interval_seconds: 2
+  # Переопределить хост Telegram Bot API (свой Bot API сервер, тестовый
+  # стенд) — пусто означает официальный api.telegram.org.
+  api_base_url_override: ""
+
+observability:
+  log_level: INFO
+  version: dev

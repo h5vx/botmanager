@@ -1,0 +1,4 @@
+bin/
+*.md
+.git/
+.gitignore
