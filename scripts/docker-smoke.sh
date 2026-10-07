@@ -46,22 +46,25 @@ wait_ready 9091 "$NAME"
 curl -fsS http://127.0.0.1:9091/readyz
 echo
 
+# grpcurl runs as the same user as everything else here: the key files are
+# 0600 and owned by that user, exactly as on the host in the README.
+grpc() {
+	docker run --rm --network host --user "$U" -v "$PWD/certs:/certs:ro" fullstorydev/grpcurl:latest "$@"
+}
+mtls=(-cacert /certs/ca.pem -cert /certs/client.pem -key /certs/client-key.pem)
+
 echo "--- mTLS call"
-docker run --rm --network host -v "$PWD/certs:/certs:ro" fullstorydev/grpcurl:latest \
-	-cacert /certs/ca.pem -cert /certs/client.pem -key /certs/client-key.pem \
-	localhost:9090 botmanager.v1.Maintenance/GetClusterStatus | tee status.json
+grpc "${mtls[@]}" localhost:9090 botmanager.v1.Maintenance/GetClusterStatus | tee status.json
 grep -Eq '"leader(Id|_id)": "node-1"' status.json
 
 echo "--- plaintext call must be rejected"
-if docker run --rm --network host fullstorydev/grpcurl:latest -plaintext localhost:9090 list >/dev/null 2>&1; then
+if grpc -plaintext localhost:9090 list >/dev/null 2>&1; then
 	echo "plaintext call was accepted" >&2
 	exit 1
 fi
 
 echo "--- token not stored in plaintext"
-docker run --rm --network host -v "$PWD/certs:/certs:ro" fullstorydev/grpcurl:latest \
-	-cacert /certs/ca.pem -cert /certs/client.pem -key /certs/client-key.pem \
-	-d '{"display_name": "smoke", "token": "123456:SMOKETESTSMOKETESTSMOKE"}' \
+grpc "${mtls[@]}" -d '{"display_name": "smoke", "token": "123456:SMOKETESTSMOKETESTSMOKE"}' \
 	localhost:9090 botmanager.v1.BotAdmin/CreateBot >/dev/null
 if grep -rq SMOKETESTSMOKETESTSMOKE data; then
 	echo "plaintext token found in the data directory" >&2
