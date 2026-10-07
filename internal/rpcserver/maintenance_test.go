@@ -13,8 +13,8 @@ import (
 
 	"github.com/hashicorp/raft"
 
+	"github.com/h5vx/botmanager/api/botmanagerpb"
 	"github.com/h5vx/botmanager/internal/raftcluster"
-	botmanagerpb "github.com/h5vx/botmanager/proto/gen"
 )
 
 // newInmemMaintenanceCluster builds an n-node Raft cluster wired via

@@ -42,14 +42,21 @@ type fsmState struct {
 	messages map[string][]*Message                // botID -> messages, oldest first, len <= retention
 	msgIndex map[string]*Message                  // idempotency_key -> message (nil entry = never has one; deletion via delete())
 	chats    map[string]map[int64]*ChatMembership // botID -> chatID -> membership registry entry
+
+	journal     []JournalEntry      // oldest first, len <= journalRetention, Seq contiguous
+	nextSeq     uint64              // Seq of the newest journal entry ever appended
+	pollOffsets map[string]int64    // botID -> getUpdates offset acknowledged through Raft
+	nodes       map[string]NodeInfo // nodeID -> addresses (node registry)
 }
 
 func newFSMState() fsmState {
 	return fsmState{
-		bots:     make(map[string]*Bot),
-		messages: make(map[string][]*Message),
-		msgIndex: make(map[string]*Message),
-		chats:    make(map[string]map[int64]*ChatMembership),
+		bots:        make(map[string]*Bot),
+		messages:    make(map[string][]*Message),
+		msgIndex:    make(map[string]*Message),
+		chats:       make(map[string]map[int64]*ChatMembership),
+		pollOffsets: make(map[string]int64),
+		nodes:       make(map[string]NodeInfo),
 	}
 }
 
@@ -62,15 +69,13 @@ func newFSMState() fsmState {
 // Message.Clone) so callers can never mutate FSM state through a returned
 // pointer.
 type FSM struct {
-	mu              sync.RWMutex
-	state           fsmState
-	retentionPerBot int
+	mu               sync.RWMutex
+	state            fsmState
+	retentionPerBot  int
+	journalRetention int
 
 	notifyMu  sync.Mutex
 	notifyChs map[chan struct{}]struct{}
-
-	eventMu  sync.Mutex
-	eventChs map[chan Event]struct{}
 }
 
 // NewFSM constructs an empty FSM. retentionPerBot must be positive; a
@@ -82,74 +87,18 @@ func NewFSM(retentionPerBot int) *FSM {
 		retentionPerBot = DefaultMessageRetentionPerBot
 	}
 	return &FSM{
-		state:           newFSMState(),
-		retentionPerBot: retentionPerBot,
-		notifyChs:       make(map[chan struct{}]struct{}),
-		eventChs:        make(map[chan Event]struct{}),
+		state:            newFSMState(),
+		retentionPerBot:  retentionPerBot,
+		journalRetention: DefaultJournalRetention,
+		notifyChs:        make(map[chan struct{}]struct{}),
 	}
 }
 
-// Event describes what changed as the result of one *successfully* applied
-// command — the detail SubscribeApplied deliberately does not carry (see
-// its doc comment: "не деталей команды"). Used by
-// Messaging.Subscribe, which must turn raftcluster changes into targeted
-// message_status_changed/bot_state_changed updates rather than
-// re-reading the entire bot/message list on every SubscribeApplied tick.
-//
-// Command names which kind of change happened so a consumer can tell a
-// real state transition (CommandSetBotState, CommandDeleteBot) from a
-// plain metadata edit (CommandUpdateBot, which also produces a Bot but
-// never changes State) without re-deriving that from Bot itself. Exactly
-// one of Bot/Message is set, matching whichever command ran. Rejected
-// commands (ApplyResult.Err != nil) never produce an Event — nothing
-// changed, so there is nothing to describe.
-type Event struct {
-	Command CommandType
-	Bot     *Bot
-	Message *Message
-}
-
-// eventBufSize mirrors internal/telegram's UpdateBus subscriberBufSize:
-// generous enough to absorb a burst without blocking Apply, small enough
-// to bound memory for a stalled subscriber. A slow Messaging.Subscribe
-// consumer loses events past this buffer rather than stalling command
-// application for the rest of the cluster — the same "at least once, not
-// exactly once" contract already documented for internal/telegram.UpdateBus
-// and the incoming-update stream.
-const eventBufSize = 256
-
-// SubscribeEvents returns a channel receiving one Event per successfully
-// applied command, and a cancel function to unsubscribe. Unlike
-// SubscribeApplied (fires for every Apply, successful or rejected, with no
-// payload), this is the typed, filtered-to-successes stream the gRPC layer
-// needs; both coexist because botlifecycle's existing "something changed,
-// re-read everything" reconciliation has no use for per-event detail.
-func (f *FSM) SubscribeEvents() (<-chan Event, func()) {
-	ch := make(chan Event, eventBufSize)
-
-	f.eventMu.Lock()
-	f.eventChs[ch] = struct{}{}
-	f.eventMu.Unlock()
-
-	cancel := func() {
-		f.eventMu.Lock()
-		delete(f.eventChs, ch)
-		f.eventMu.Unlock()
-	}
-	return ch, cancel
-}
-
-func (f *FSM) publishEvent(ev Event) {
-	f.eventMu.Lock()
-	defer f.eventMu.Unlock()
-	for ch := range f.eventChs {
-		select {
-		case ch <- ev:
-		default:
-			// Отставший подписчик — теряем событие для него, не блокируем
-			// ни Apply, ни остальных подписчиков (та же политика, что и
-			// telegram.InMemoryBus и notifyApplied выше).
-		}
+// SetJournalRetention overrides DefaultJournalRetention; n <= 0 is ignored.
+// Must be called before the FSM is handed to Raft.
+func (f *FSM) SetJournalRetention(n int) {
+	if n > 0 {
+		f.journalRetention = n
 	}
 }
 
@@ -197,6 +146,12 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 	}
 
 	f.mu.Lock()
+	created := false
+	if cmd.Type == CommandPutMessage && cmd.PutMessage != nil {
+		_, exists := f.state.msgIndex[cmd.PutMessage.IdempotencyKey]
+		created = !exists
+	}
+
 	var result *ApplyResult
 	switch cmd.Type {
 	case CommandCreateBot:
@@ -215,19 +170,22 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 		result = f.applyCancelPending(cmd.CancelPending)
 	case CommandUpdateChatMembership:
 		result = f.applyUpdateChatMembership(cmd.UpdateChatMembership)
+	case CommandRecordUpdates:
+		result = f.applyRecordUpdates(cmd.RecordUpdates)
+	case CommandRegisterNode:
+		result = f.applyRegisterNode(cmd.RegisterNode)
+	case CommandUnregisterNode:
+		result = f.applyUnregisterNode(cmd.UnregisterNode)
 	default:
 		result = &ApplyResult{Err: fmt.Errorf("%w: unknown type %q", ErrInvalidCommand, cmd.Type)}
 	}
+	if result.Err == nil {
+		// Время события — AppendedAt записи журнала Raft: его выставляет
+		// лидер, и оно одинаково на всех репликах (в отличие от time.Now()).
+		f.journalForCommand(cmd, result, created, log.AppendedAt.UTC())
+	}
 	f.mu.Unlock()
 
-	if result.Err == nil && (result.Bot != nil || result.Message != nil) {
-		f.publishEvent(Event{Command: cmd.Type, Bot: result.Bot, Message: result.Message})
-	}
-	// Chat registry changes are not forwarded through Event/SubscribeEvents:
-	// the live chat_member_changed Update already reaches
-	// Messaging.Subscribe via telegram.UpdateBus (messaging_subscribe.go),
-	// from the same source event that produced this command — a second,
-	// redundant notification path is not needed.
 	return result
 }
 

@@ -39,7 +39,7 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 
 func startTestRunner(t *testing.T, cluster ClusterView, apiBaseURL string, bot raftcluster.Bot) botlifecycle.BotRunner {
 	t.Helper()
-	factory := NewRunnerFactory(cluster, NewInMemoryBus(), Config{
+	factory := NewRunnerFactory(cluster, Config{
 		APIBaseURL:       apiBaseURL,
 		RequestTimeout:   time.Second,
 		LongPollTimeout:  time.Second,
@@ -256,7 +256,7 @@ func TestRunner_MalformedTokenRejectedByStart(t *testing.T) {
 	bot := raftcluster.Bot{ID: "bot-1", Token: "not-a-real-token", State: raftcluster.BotStateEnabled}
 	cluster.addBot(bot)
 
-	factory := NewRunnerFactory(cluster, NewInMemoryBus(), Config{}, raftcluster.ProxyConfig{}, testLogger())
+	factory := NewRunnerFactory(cluster, Config{}, raftcluster.ProxyConfig{}, testLogger())
 	runner := factory()
 
 	err := runner.Start(context.Background(), bot)
@@ -277,7 +277,7 @@ func TestRunner_ContextCancelStopsLoopsPromptly(t *testing.T) {
 	bot := raftcluster.Bot{ID: "bot-1", Token: validTestToken, State: raftcluster.BotStateEnabled}
 	cluster.addBot(bot)
 
-	factory := NewRunnerFactory(cluster, NewInMemoryBus(), Config{
+	factory := NewRunnerFactory(cluster, Config{
 		APIBaseURL:       srv.URL,
 		RequestTimeout:   time.Second,
 		LongPollTimeout:  time.Second,

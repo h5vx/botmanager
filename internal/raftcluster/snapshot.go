@@ -17,6 +17,11 @@ type persistedState struct {
 	Bots     []Bot                       `json:"bots"`
 	Messages map[string][]Message        `json:"messages"`        // botID -> messages, oldest first
 	Chats    map[string][]ChatMembership `json:"chats,omitempty"` // botID -> chat registry entries, order not meaningful
+
+	Journal     []JournalEntry   `json:"journal,omitempty"` // oldest first
+	NextSeq     uint64           `json:"next_seq,omitempty"`
+	PollOffsets map[string]int64 `json:"poll_offsets,omitempty"`
+	Nodes       []NodeInfo       `json:"nodes,omitempty"`
 }
 
 // Snapshot implements raft.FSM (embedded BoltDB storage as the Raft state
@@ -55,6 +60,18 @@ func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
 		ps.Chats[botID] = clones
 	}
 
+	ps.Journal = make([]JournalEntry, len(f.state.journal))
+	copy(ps.Journal, f.state.journal)
+	ps.NextSeq = f.state.nextSeq
+	ps.PollOffsets = make(map[string]int64, len(f.state.pollOffsets))
+	for botID, off := range f.state.pollOffsets {
+		ps.PollOffsets[botID] = off
+	}
+	for _, n := range f.state.nodes {
+		ps.Nodes = append(ps.Nodes, n)
+	}
+	sort.Slice(ps.Nodes, func(i, j int) bool { return ps.Nodes[i].ID < ps.Nodes[j].ID })
+
 	return &fsmSnapshot{state: ps}, nil
 }
 
@@ -90,6 +107,14 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 			byChat[entry.ChatID] = &entry
 		}
 		newState.chats[botID] = byChat
+	}
+	newState.journal = ps.Journal
+	newState.nextSeq = ps.NextSeq
+	for botID, off := range ps.PollOffsets {
+		newState.pollOffsets[botID] = off
+	}
+	for _, n := range ps.Nodes {
+		newState.nodes[n.ID] = n
 	}
 
 	f.mu.Lock()

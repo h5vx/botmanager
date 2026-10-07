@@ -12,7 +12,10 @@ FROM golang:1.25-alpine AS builder
 
 WORKDIR /src
 
+# api/ — отдельный модуль (контракт + клиент), на который основной модуль
+# ссылается через replace; без него go mod download не разрешит зависимость.
 COPY go.mod go.sum ./
+COPY api/go.mod api/go.sum ./api/
 RUN go mod download
 
 COPY . .
@@ -23,7 +26,7 @@ COPY . .
 # `--chmod=644` на config/config.yaml делает НЕПРОХОДИМЫМ (без +x) сам
 # каталог /app/config — nonroot не может его открыть. Правильно —
 # директории 755 (traverse+list), файлу 644 (read) достаточно.
-RUN chmod 755 config && chmod 644 config/config.yaml
+RUN chmod 755 config && chmod 644 config/*.yaml
 
 # node.data_dir (config/config.yaml: /var/lib/botmanager по умолчанию) —
 # каталог BoltDB-журнала Raft и снимков (internal/raftcluster), которого в
@@ -55,7 +58,10 @@ COPY --from=builder --chown=65532:65532 /src/config /app/config
 # shell, ни mkdir.
 COPY --from=builder --chown=65532:65532 /out/data /var/lib/botmanager
 
-EXPOSE 9090 9091
+# 9090 — gRPC API, 9091 — /healthz /readyz /metrics, 9092 — Raft.
+# Сертификаты и ключ токенов ожидаются в /etc/botmanager/certs (см.
+# security.* в config/config.yaml) — смонтируйте их томом или секретом.
+EXPOSE 9090 9091 9092
 
 USER nonroot:nonroot
 

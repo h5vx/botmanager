@@ -1,72 +1,86 @@
 package rpcserver
 
 import (
+	"strconv"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+
+	"github.com/h5vx/botmanager/api/botmanagerpb"
 	"github.com/h5vx/botmanager/internal/raftcluster"
-	"github.com/h5vx/botmanager/internal/telegram"
-	botmanagerpb "github.com/h5vx/botmanager/proto/gen"
 )
 
-// Subscribe merges two independent event sources into one stream (see
-// doc.go): telegram.UpdateBus (incoming_message/callback_query/
-// chat_member_changed, produced directly by Telegram long polling) and
-// raftcluster.Node.SubscribeEvents (message_status_changed/
-// bot_state_changed, produced by the replicated command stream). Both
-// subscriptions are cancelled via defer when the stream ends for any reason
-// (client disconnect, error, ctx cancellation) — stream.Context() is the
-// only lifetime signal a server-streaming RPC gets.
+// subscribeBatch bounds how many journal entries Subscribe copies out of
+// the FSM per read.
+const subscribeBatch = 512
+
+// Subscribe streams the replicated journal (raftcluster.JournalEntry): both
+// updates received from Telegram (incoming_message/callback_query/
+// chat_member_changed, recorded by the leader's poll loop) and changes
+// produced by commands (message_status_changed/bot_state_changed). Because
+// the journal is replicated, any node can serve the stream, and every event
+// carries the same sequence number on every node.
 //
-// CommandCreateBot/CommandUpdateBot are deliberately NOT translated into
-// bot_state_changed here: neither changes Bot.State (enabled/
-// disabled/broken/deleted), and BotStateChanged's own fields (state,
-// failure_class, reason) have nothing meaningful to report for a plain
-// metadata edit — see FSM.Event's doc comment distinguishing "a real state
-// transition" from "a plain metadata edit" for the same reasoning.
+// Without after_sequence the stream starts at the current end of the
+// journal. With after_sequence it first replays every retained entry with a
+// higher sequence; if part of the requested range has already been evicted
+// by retention, the stream ends with OUT_OF_RANGE so the caller learns it
+// missed events instead of silently skipping them. The same happens if a
+// subscriber falls so far behind that retention overtakes it.
+//
+// CommandCreateBot/CommandUpdateBot are not journaled: neither changes
+// Bot.State, and a metadata edit has nothing to report in BotStateChanged.
 func (s *MessagingServer) Subscribe(req *botmanagerpb.SubscribeRequest, stream botmanagerpb.Messaging_SubscribeServer) error {
 	wanted := botIDSet(req.GetBotIds())
 
-	updCh, cancelUpd := s.bus.Subscribe()
-	defer cancelUpd()
-	evCh, cancelEv := s.node.SubscribeEvents()
-	defer cancelEv()
+	wake, cancel := s.node.SubscribeApplied()
+	defer cancel()
+
+	var cursor uint64
+	if req.AfterSequence != nil {
+		cursor = req.GetAfterSequence()
+	} else {
+		_, _, cursor = s.node.ReadJournal(^uint64(0), 1)
+	}
+	if err := stream.SendHeader(metadata.Pairs(botmanagerpb.SubscribePositionHeader, strconv.FormatUint(cursor, 10))); err != nil {
+		return err
+	}
 
 	ctx := stream.Context()
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-
-		case u, ok := <-updCh:
-			if !ok {
-				return nil
-			}
-			if !wanted.matches(u.BotID) {
+		entries, oldest, _ := s.node.ReadJournal(cursor, subscribeBatch)
+		if oldest > 0 && cursor+1 < oldest && len(entries) > 0 {
+			return status.Errorf(codes.OutOfRange,
+				"events after sequence %d are no longer retained (oldest retained: %d); resubscribe without after_sequence", cursor, oldest)
+		}
+		for _, e := range entries {
+			cursor = e.Seq
+			if !wanted.matches(e.BotID) {
 				continue
 			}
-			out := telegramUpdateToProto(u)
+			out := journalEntryToProto(e)
 			if out == nil {
 				continue
 			}
 			if err := stream.Send(out); err != nil {
 				return err
 			}
+		}
+		if len(entries) == subscribeBatch {
+			continue
+		}
 
-		case ev, ok := <-evCh:
-			if !ok {
-				return nil
-			}
-			botID, out := fsmEventToProto(ev)
-			if out == nil || !wanted.matches(botID) {
-				continue
-			}
-			if err := stream.Send(out); err != nil {
-				return err
-			}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-wake:
 		}
 	}
 }
 
-// botIDFilterSet implements SubscribeRequest.bot_ids' "empty = all bots on
-// this node" rule.
+// botIDFilterSet implements SubscribeRequest.bot_ids' "empty = all bots"
+// rule.
 type botIDFilterSet map[string]struct{}
 
 func botIDSet(ids []string) botIDFilterSet {
@@ -88,95 +102,67 @@ func (s botIDFilterSet) matches(botID string) bool {
 	return ok
 }
 
-// telegramUpdateToProto converts one telegram.Update to a botmanagerpb.Update,
-// or nil for an UpdateKind this server does not forward (there is currently
-// none — every telegram.UpdateKind has a corresponding Update.payload case
-// — but Subscribe treats nil defensively rather than assuming exhaustiveness
-// holds forever).
-func telegramUpdateToProto(u telegram.Update) *botmanagerpb.Update {
-	occurredAt := toProtoTime(u.ReceivedAt)
-	switch u.Kind {
-	case telegram.UpdateKindIncomingMessage:
-		return &botmanagerpb.Update{
-			OccurredAt: occurredAt,
-			Payload: &botmanagerpb.Update_IncomingMessage{IncomingMessage: &botmanagerpb.IncomingMessage{
-				BotId:      u.BotID,
-				ChatId:     u.ChatID,
-				MessageId:  u.MessageID,
-				FromUserId: u.FromUserID,
-				Text:       u.Text,
-				ReceivedAt: occurredAt,
-			}},
+// journalEntryToProto converts one journal entry to a botmanagerpb.Update,
+// or nil for a kind this server does not know (defensive: every kind
+// written today has a case).
+func journalEntryToProto(e raftcluster.JournalEntry) *botmanagerpb.Update {
+	out := &botmanagerpb.Update{Sequence: e.Seq, OccurredAt: toProtoTime(e.OccurredAt)}
+	switch e.Kind {
+	case raftcluster.JournalIncomingMessage:
+		if e.Update == nil {
+			return nil
 		}
-	case telegram.UpdateKindCallbackQuery:
-		return &botmanagerpb.Update{
-			OccurredAt: occurredAt,
-			Payload: &botmanagerpb.Update_CallbackQuery{CallbackQuery: &botmanagerpb.CallbackQuery{
-				BotId:           u.BotID,
-				CallbackQueryId: u.CallbackQueryID,
-				ChatId:          u.ChatID,
-				MessageId:       u.MessageID,
-				FromUserId:      u.FromUserID,
-				Data:            u.CallbackData,
-			}},
+		u := e.Update
+		out.Payload = &botmanagerpb.Update_IncomingMessage{IncomingMessage: &botmanagerpb.IncomingMessage{
+			BotId:      e.BotID,
+			ChatId:     u.ChatID,
+			MessageId:  u.MessageID,
+			FromUserId: u.FromUserID,
+			Text:       u.Text,
+			ReceivedAt: toProtoTime(u.ReceivedAt),
+		}}
+	case raftcluster.JournalCallbackQuery:
+		if e.Update == nil {
+			return nil
 		}
-	case telegram.UpdateKindChatMemberChanged:
-		return &botmanagerpb.Update{
-			OccurredAt: occurredAt,
-			Payload: &botmanagerpb.Update_ChatMemberChanged{ChatMemberChanged: &botmanagerpb.ChatMemberChanged{
-				BotId:       u.BotID,
-				ChatId:      u.ChatID,
-				BotIsMember: chatMemberStatusIsMember(u.NewChatMemberStatus),
-			}},
+		u := e.Update
+		out.Payload = &botmanagerpb.Update_CallbackQuery{CallbackQuery: &botmanagerpb.CallbackQuery{
+			BotId:           e.BotID,
+			CallbackQueryId: u.CallbackQueryID,
+			ChatId:          u.ChatID,
+			MessageId:       u.MessageID,
+			FromUserId:      u.FromUserID,
+			Data:            u.CallbackData,
+		}}
+	case raftcluster.JournalChatMemberChanged:
+		if e.Update == nil {
+			return nil
 		}
+		out.Payload = &botmanagerpb.Update_ChatMemberChanged{ChatMemberChanged: &botmanagerpb.ChatMemberChanged{
+			BotId:       e.BotID,
+			ChatId:      e.Update.ChatID,
+			BotIsMember: raftcluster.ChatMemberStatusIsMember(e.Update.NewChatMemberStatus),
+		}}
+	case raftcluster.JournalMessageStatusChanged:
+		if e.Delivery == nil {
+			return nil
+		}
+		out.Payload = &botmanagerpb.Update_MessageStatusChanged{MessageStatusChanged: &botmanagerpb.MessageStatusChanged{
+			IdempotencyKey: e.IdempotencyKey,
+			Delivery:       deliveryToProto(*e.Delivery),
+		}}
+	case raftcluster.JournalBotStateChanged:
+		if e.BotState == nil {
+			return nil
+		}
+		out.Payload = &botmanagerpb.Update_BotStateChanged{BotStateChanged: &botmanagerpb.BotStateChanged{
+			BotId:        e.BotID,
+			State:        botStateToProto(e.BotState.State),
+			FailureClass: failureClassToProto(e.BotState.FailureClass),
+			Reason:       e.BotState.Reason,
+		}}
 	default:
 		return nil
 	}
-}
-
-// chatMemberStatusIsMember mirrors chatMemberRights' "left"/"kicked" =
-// not-a-member reading of Telegram's my_chat_member.new_chat_member.status
-// (convert.go) — reused here for ChatMemberChanged.bot_is_member, which
-// needs only the membership half, not the rights booleans.
-func chatMemberStatusIsMember(status string) bool {
-	switch status {
-	case "left", "kicked":
-		return false
-	default:
-		return status != ""
-	}
-}
-
-// fsmEventToProto converts one raftcluster.Event to a botmanagerpb.Update
-// plus the bot_id to filter Subscribe by, or ("", nil) for an event kind
-// Subscribe does not forward (see the doc comment above Subscribe).
-func fsmEventToProto(ev raftcluster.Event) (botID string, out *botmanagerpb.Update) {
-	switch ev.Command {
-	case raftcluster.CommandPutMessage, raftcluster.CommandUpdateDelivery, raftcluster.CommandCancelPending:
-		if ev.Message == nil {
-			return "", nil
-		}
-		return ev.Message.BotID, &botmanagerpb.Update{
-			OccurredAt: timestamppbNow(),
-			Payload: &botmanagerpb.Update_MessageStatusChanged{MessageStatusChanged: &botmanagerpb.MessageStatusChanged{
-				IdempotencyKey: ev.Message.IdempotencyKey,
-				Delivery:       deliveryToProto(ev.Message.Delivery),
-			}},
-		}
-	case raftcluster.CommandSetBotState, raftcluster.CommandDeleteBot:
-		if ev.Bot == nil {
-			return "", nil
-		}
-		return ev.Bot.ID, &botmanagerpb.Update{
-			OccurredAt: timestamppbNow(),
-			Payload: &botmanagerpb.Update_BotStateChanged{BotStateChanged: &botmanagerpb.BotStateChanged{
-				BotId:        ev.Bot.ID,
-				State:        botStateToProto(ev.Bot.State),
-				FailureClass: failureClassToProto(ev.Bot.LastFailureClass),
-				Reason:       ev.Bot.LastFailureReason,
-			}},
-		}
-	default:
-		return "", nil
-	}
+	return out
 }

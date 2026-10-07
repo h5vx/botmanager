@@ -12,15 +12,19 @@ import (
 // fakeCluster is a minimal in-memory stand-in for *raftcluster.Node,
 // implementing exactly the telegram.ClusterView methods Runner needs — the
 // same pattern botlifecycle/manager_test.go uses for its fakeCluster. It is
-// not a general-purpose FSM re-implementation: only CommandUpdateDelivery
-// and CommandSetBotState are supported (the only two Command types a
-// Runner ever applies), matching real Node.Apply's convention of returning
+// not a general-purpose FSM re-implementation: only CommandUpdateDelivery,
+// CommandSetBotState and CommandRecordUpdates are supported (the Command
+// types a Runner applies), matching real Node.Apply's convention of returning
 // (nil, err) for a rejected command.
 type fakeCluster struct {
 	mu       sync.Mutex
 	messages map[string]*raftcluster.Message
 	bots     map[string]*raftcluster.Bot
-	chats    []raftcluster.UpdateChatMembershipCommand // applied commands, in order — recordChatMembership assertions
+	records  []raftcluster.RecordUpdatesCommand // applied record_updates commands, in order
+	offsets  map[string]int64
+	// failRecords, when > 0, makes that many record_updates Apply calls
+	// fail (cluster unavailable) before succeeding again.
+	failRecords int
 
 	notifyMu sync.Mutex
 	subs     map[chan struct{}]struct{}
@@ -30,16 +34,35 @@ func newFakeCluster() *fakeCluster {
 	return &fakeCluster{
 		messages: make(map[string]*raftcluster.Message),
 		bots:     make(map[string]*raftcluster.Bot),
+		offsets:  make(map[string]int64),
 		subs:     make(map[chan struct{}]struct{}),
 	}
 }
 
-func (f *fakeCluster) appliedChatMemberships() []raftcluster.UpdateChatMembershipCommand {
+func (f *fakeCluster) appliedRecords() []raftcluster.RecordUpdatesCommand {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	out := make([]raftcluster.UpdateChatMembershipCommand, len(f.chats))
-	copy(out, f.chats)
+	out := make([]raftcluster.RecordUpdatesCommand, len(f.records))
+	copy(out, f.records)
 	return out
+}
+
+func (f *fakeCluster) setOffset(botID string, off int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.offsets[botID] = off
+}
+
+func (f *fakeCluster) setFailRecords(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failRecords = n
+}
+
+func (f *fakeCluster) PollOffset(botID string) int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.offsets[botID]
 }
 
 func (f *fakeCluster) addBot(bot raftcluster.Bot) {
@@ -105,12 +128,18 @@ func (f *fakeCluster) Apply(cmd raftcluster.Command, _ time.Duration) (*raftclus
 		cp := *bot
 		result = &raftcluster.ApplyResult{Bot: &cp}
 
-	case raftcluster.CommandUpdateChatMembership:
-		c := *cmd.UpdateChatMembership
-		f.chats = append(f.chats, c)
-		result = &raftcluster.ApplyResult{Chat: &raftcluster.ChatMembership{
-			BotID: c.BotID, ChatID: c.ChatID, Title: c.Title, IsMember: c.IsMember, ChangedAt: c.ChangedAt,
-		}}
+	case raftcluster.CommandRecordUpdates:
+		if f.failRecords > 0 {
+			f.failRecords--
+			f.mu.Unlock()
+			return nil, fmt.Errorf("fakeCluster: cluster unavailable")
+		}
+		c := *cmd.RecordUpdates
+		f.records = append(f.records, c)
+		if c.NextOffset > f.offsets[c.BotID] {
+			f.offsets[c.BotID] = c.NextOffset
+		}
+		result = &raftcluster.ApplyResult{}
 
 	default:
 		f.mu.Unlock()

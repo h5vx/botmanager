@@ -6,9 +6,12 @@
 package config
 
 import (
+	"encoding"
 	"fmt"
+	"net"
 	"os"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -26,16 +29,21 @@ type Config struct {
 	HTTP          HTTPConfig          `yaml:"http"`
 	Proxy         ProxyConfig         `yaml:"proxy"`
 	Telegram      TelegramConfig      `yaml:"telegram"`
+	Security      SecurityConfig      `yaml:"security"`
 	Observability ObservabilityConfig `yaml:"observability"`
 }
 
 // NodeConfig — идентификация узла Raft-кластера: node.id — Raft
 // server ID, node.data_dir — каталог BoltDB-журнала и снимков,
 // node.raft_bind_addr — адрес, на котором слушает Raft-транспорт узла.
+// Advertise-адреса — те, по которым узел доступен остальным узлам кластера
+// (обязательны, если bind-адрес не маршрутизируем, например 0.0.0.0).
 type NodeConfig struct {
-	ID       string `yaml:"id"`
-	DataDir  string `yaml:"data_dir"`
-	RaftBind string `yaml:"raft_bind_addr"`
+	ID            string `yaml:"id"`
+	DataDir       string `yaml:"data_dir"`
+	RaftBind      string `yaml:"raft_bind_addr"`
+	RaftAdvertise string `yaml:"raft_advertise_addr"` // пусто = raft_bind_addr
+	GRPCAdvertise string `yaml:"grpc_advertise_addr"` // пусто = хост raft-адреса + порт grpc.listen_addr
 }
 
 // RaftConfig — настройки, специфичные для поведения Raft-кластера этого
@@ -49,8 +57,110 @@ type RaftConfig struct {
 	// Bootstrap — бутстрапить ли новый кластер на этом узле, если у него
 	// ещё нет состояния Raft (см. raftcluster.Config.Bootstrap). Безопасно
 	// оставлять true между перезапусками — бутстрап не выполняется
-	// повторно, если состояние уже есть.
+	// повторно, если состояние уже есть. Узел, который будет добавлен в
+	// уже работающий кластер через Maintenance.AddNode, запускают с false.
 	Bootstrap bool `yaml:"bootstrap"`
+	// JournalRetention — сколько последних событий журнала Subscribe
+	// хранить (raftcluster.DefaultJournalRetention).
+	JournalRetention int `yaml:"journal_retention"`
+	// Peers — остальные узлы кластера при статическом развёртывании: вместе
+	// с bootstrap задают начальный состав кластера (одинаковый на всех
+	// узлах) и gRPC-адреса для пересылки записей лидеру.
+	Peers PeerList `yaml:"peers"`
+}
+
+// PeerConfig — один узел кластера из статической конфигурации.
+type PeerConfig struct {
+	ID       string `yaml:"id"`
+	RaftAddr string `yaml:"raft_addr"`
+	GRPCAddr string `yaml:"grpc_addr"`
+}
+
+// PeerList — список узлов. В YAML — обычный список, в переменной окружения
+// (BOTMANAGER_RAFT__PEERS) — строка "id/raft_addr/grpc_addr" через запятую.
+type PeerList []PeerConfig
+
+// UnmarshalText разбирает строковую форму PeerList.
+func (p *PeerList) UnmarshalText(text []byte) error {
+	var out PeerList
+	for _, item := range strings.Split(string(text), ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		parts := strings.Split(item, "/")
+		if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+			return fmt.Errorf("peer %q: want id/raft_addr/grpc_addr", item)
+		}
+		out = append(out, PeerConfig{ID: parts[0], RaftAddr: parts[1], GRPCAddr: parts[2]})
+	}
+	*p = out
+	return nil
+}
+
+// SecurityConfig — mTLS для gRPC API и Raft-транспорта и ключ шифрования
+// токенов ботов. Без них узел не стартует, если явно не включён
+// insecure-режим (только для локальной разработки: всё ходит открытым
+// текстом, без аутентификации, токены хранятся как есть).
+type SecurityConfig struct {
+	Insecure bool   `yaml:"insecure"`
+	CAFile   string `yaml:"ca_file"`   // CA, которым подписаны сертификаты узлов и клиентов
+	CertFile string `yaml:"cert_file"` // сертификат этого узла (сервер и клиент одновременно)
+	KeyFile  string `yaml:"key_file"`
+	// TokenKeyFile — файл с 32 байтами в base64: ключ AES-256-GCM для
+	// токенов ботов. Одинаковый на всех узлах кластера.
+	TokenKeyFile string `yaml:"token_key_file"`
+}
+
+// Validate проверяет согласованность настроек, которые нельзя оставить
+// пустыми.
+func (c Config) Validate() error {
+	if c.Node.ID == "" {
+		return fmt.Errorf("config: node.id is required")
+	}
+	if !c.Security.Insecure {
+		var missing []string
+		for name, v := range map[string]string{
+			"security.ca_file": c.Security.CAFile, "security.cert_file": c.Security.CertFile,
+			"security.key_file": c.Security.KeyFile, "security.token_key_file": c.Security.TokenKeyFile,
+		} {
+			if v == "" {
+				missing = append(missing, name)
+			}
+		}
+		if len(missing) > 0 {
+			slices.Sort(missing)
+			return fmt.Errorf("config: %s required (or set security.insecure: true for local development only)", strings.Join(missing, ", "))
+		}
+	}
+	for _, p := range c.Raft.Peers {
+		if p.ID == "" || p.RaftAddr == "" || p.GRPCAddr == "" {
+			return fmt.Errorf("config: raft.peers entry %+v: id, raft_addr and grpc_addr are required", p)
+		}
+	}
+	return nil
+}
+
+// GRPCAdvertiseAddr возвращает gRPC-адрес узла для остальных узлов:
+// node.grpc_advertise_addr или, если он пуст, хост Raft-адреса с портом
+// grpc.listen_addr.
+func (c Config) GRPCAdvertiseAddr() (string, error) {
+	if c.Node.GRPCAdvertise != "" {
+		return c.Node.GRPCAdvertise, nil
+	}
+	raftAddr := c.Node.RaftAdvertise
+	if raftAddr == "" {
+		raftAddr = c.Node.RaftBind
+	}
+	host, _, err := net.SplitHostPort(raftAddr)
+	if err != nil {
+		return "", fmt.Errorf("config: raft address %q: %w", raftAddr, err)
+	}
+	_, port, err := net.SplitHostPort(c.GRPC.ListenAddr)
+	if err != nil {
+		return "", fmt.Errorf("config: grpc.listen_addr %q: %w", c.GRPC.ListenAddr, err)
+	}
+	return net.JoinHostPort(host, port), nil
 }
 
 // GRPCConfig — адрес, на котором слушает BotAdmin/Messaging/Maintenance.
@@ -109,9 +219,9 @@ type ObservabilityConfig struct {
 // EnvPrefix — префикс переменных окружения, переопределяющих YAML.
 const EnvPrefix = "BOTMANAGER_"
 
-// Default возвращает конфигурацию по умолчанию — те же значения, что и в
-// config/config.yaml, на случай если файл не найден и переопределения не
-// заданы.
+// Default возвращает базовые значения, поверх которых накладываются файл и
+// переменные окружения. Настроек security здесь нет намеренно: без них
+// (или явного security.insecure) Load завершится ошибкой.
 func Default() Config {
 	return Config{
 		Node: NodeConfig{
@@ -121,6 +231,7 @@ func Default() Config {
 		},
 		Raft: RaftConfig{
 			MessageRetentionPerBot: raftcluster.DefaultMessageRetentionPerBot,
+			JournalRetention:       raftcluster.DefaultJournalRetention,
 			Bootstrap:              true,
 		},
 		GRPC: GRPCConfig{ListenAddr: ":9090"},
@@ -166,6 +277,9 @@ func Load(path string) (Config, error) {
 	if err := applyEnvOverrides(&cfg, EnvPrefix, os.LookupEnv); err != nil {
 		return Config{}, fmt.Errorf("config: env override: %w", err)
 	}
+	if err := cfg.Validate(); err != nil {
+		return Config{}, err
+	}
 
 	return cfg, nil
 }
@@ -209,6 +323,9 @@ func applyEnvOverrides(v any, prefix string, lookup func(string) (string, bool))
 }
 
 func setScalar(fv reflect.Value, raw string) error {
+	if tu, ok := fv.Addr().Interface().(encoding.TextUnmarshaler); ok {
+		return tu.UnmarshalText([]byte(raw))
+	}
 	switch fv.Kind() {
 	case reflect.String:
 		fv.SetString(raw)

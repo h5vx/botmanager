@@ -2464,8 +2464,13 @@ func (x *ListMessagesRequest) GetCreatedTo() *timestamppb.Timestamp {
 }
 
 type SubscribeRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	BotIds        []string               `protobuf:"bytes,1,rep,name=bot_ids,json=botIds,proto3" json:"bot_ids,omitempty"` // пусто = все боты узла
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	BotIds []string               `protobuf:"bytes,1,rep,name=bot_ids,json=botIds,proto3" json:"bot_ids,omitempty"` // пусто = все боты
+	// Возобновление потока. Не задано — только новые события, начиная с
+	// момента подписки. Задано — сначала все сохранённые события с
+	// sequence > after_sequence, затем новые. Если часть запрошенной истории
+	// уже вытеснена retention журнала, поток завершается с OUT_OF_RANGE.
+	AfterSequence *uint64 `protobuf:"varint,2,opt,name=after_sequence,json=afterSequence,proto3,oneof" json:"after_sequence,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2505,6 +2510,13 @@ func (x *SubscribeRequest) GetBotIds() []string {
 		return x.BotIds
 	}
 	return nil
+}
+
+func (x *SubscribeRequest) GetAfterSequence() uint64 {
+	if x != nil && x.AfterSequence != nil {
+		return *x.AfterSequence
+	}
+	return 0
 }
 
 // Виды обновления в потоке Subscribe (не только входящие сообщения).
@@ -2859,6 +2871,10 @@ func (x *BotStateChanged) GetReason() string {
 type Update struct {
 	state      protoimpl.MessageState `protogen:"open.v1"`
 	OccurredAt *timestamppb.Timestamp `protobuf:"bytes,1,opt,name=occurred_at,json=occurredAt,proto3" json:"occurred_at,omitempty"`
+	// Номер события в реплицированном журнале: строго возрастает и одинаков
+	// на всех узлах кластера. Используется для возобновления Subscribe
+	// (SubscribeRequest.after_sequence) и дедупликации на стороне клиента.
+	Sequence uint64 `protobuf:"varint,7,opt,name=sequence,proto3" json:"sequence,omitempty"`
 	// Types that are valid to be assigned to Payload:
 	//
 	//	*Update_IncomingMessage
@@ -2906,6 +2922,13 @@ func (x *Update) GetOccurredAt() *timestamppb.Timestamp {
 		return x.OccurredAt
 	}
 	return nil
+}
+
+func (x *Update) GetSequence() uint64 {
+	if x != nil {
+		return x.Sequence
+	}
+	return 0
 }
 
 func (x *Update) GetPayload() isUpdate_Payload {
@@ -3001,6 +3024,8 @@ type NodeStatus struct {
 	IsLeader      bool                   `protobuf:"varint,2,opt,name=is_leader,json=isLeader,proto3" json:"is_leader,omitempty"`
 	Reachable     bool                   `protobuf:"varint,3,opt,name=reachable,proto3" json:"reachable,omitempty"`
 	ProxyHealthy  bool                   `protobuf:"varint,4,opt,name=proxy_healthy,json=proxyHealthy,proto3" json:"proxy_healthy,omitempty"` // здоровье прокси проверяется отдельно от Telegram
+	RaftAddress   string                 `protobuf:"bytes,5,opt,name=raft_address,json=raftAddress,proto3" json:"raft_address,omitempty"`
+	GrpcAddress   string                 `protobuf:"bytes,6,opt,name=grpc_address,json=grpcAddress,proto3" json:"grpc_address,omitempty"` // пусто, если узел ещё не зарегистрировал свой gRPC-адрес
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3061,6 +3086,20 @@ func (x *NodeStatus) GetProxyHealthy() bool {
 		return x.ProxyHealthy
 	}
 	return false
+}
+
+func (x *NodeStatus) GetRaftAddress() string {
+	if x != nil {
+		return x.RaftAddress
+	}
+	return ""
+}
+
+func (x *NodeStatus) GetGrpcAddress() string {
+	if x != nil {
+		return x.GrpcAddress
+	}
+	return ""
 }
 
 type ClusterStatus struct {
@@ -3159,6 +3198,113 @@ func (*ExportStateRequest) Descriptor() ([]byte, []int) {
 	return file_botmanager_proto_rawDescGZIP(), []int{46}
 }
 
+// AddNodeRequest — добавить узел в кластер голосующим членом. Узел должен
+// быть уже запущен (без bootstrap) и доступен по raft_address.
+type AddNodeRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	NodeId        string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	RaftAddress   string                 `protobuf:"bytes,2,opt,name=raft_address,json=raftAddress,proto3" json:"raft_address,omitempty"`
+	GrpcAddress   string                 `protobuf:"bytes,3,opt,name=grpc_address,json=grpcAddress,proto3" json:"grpc_address,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AddNodeRequest) Reset() {
+	*x = AddNodeRequest{}
+	mi := &file_botmanager_proto_msgTypes[47]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AddNodeRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AddNodeRequest) ProtoMessage() {}
+
+func (x *AddNodeRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_botmanager_proto_msgTypes[47]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AddNodeRequest.ProtoReflect.Descriptor instead.
+func (*AddNodeRequest) Descriptor() ([]byte, []int) {
+	return file_botmanager_proto_rawDescGZIP(), []int{47}
+}
+
+func (x *AddNodeRequest) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *AddNodeRequest) GetRaftAddress() string {
+	if x != nil {
+		return x.RaftAddress
+	}
+	return ""
+}
+
+func (x *AddNodeRequest) GetGrpcAddress() string {
+	if x != nil {
+		return x.GrpcAddress
+	}
+	return ""
+}
+
+// RemoveNodeRequest — вывести узел из кластера.
+type RemoveNodeRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	NodeId        string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RemoveNodeRequest) Reset() {
+	*x = RemoveNodeRequest{}
+	mi := &file_botmanager_proto_msgTypes[48]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RemoveNodeRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RemoveNodeRequest) ProtoMessage() {}
+
+func (x *RemoveNodeRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_botmanager_proto_msgTypes[48]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RemoveNodeRequest.ProtoReflect.Descriptor instead.
+func (*RemoveNodeRequest) Descriptor() ([]byte, []int) {
+	return file_botmanager_proto_rawDescGZIP(), []int{48}
+}
+
+func (x *RemoveNodeRequest) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
 type Chunk struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Data          []byte                 `protobuf:"bytes,1,opt,name=data,proto3" json:"data,omitempty"`
@@ -3168,7 +3314,7 @@ type Chunk struct {
 
 func (x *Chunk) Reset() {
 	*x = Chunk{}
-	mi := &file_botmanager_proto_msgTypes[47]
+	mi := &file_botmanager_proto_msgTypes[49]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3180,7 +3326,7 @@ func (x *Chunk) String() string {
 func (*Chunk) ProtoMessage() {}
 
 func (x *Chunk) ProtoReflect() protoreflect.Message {
-	mi := &file_botmanager_proto_msgTypes[47]
+	mi := &file_botmanager_proto_msgTypes[49]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3193,7 +3339,7 @@ func (x *Chunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Chunk.ProtoReflect.Descriptor instead.
 func (*Chunk) Descriptor() ([]byte, []int) {
-	return file_botmanager_proto_rawDescGZIP(), []int{47}
+	return file_botmanager_proto_rawDescGZIP(), []int{49}
 }
 
 func (x *Chunk) GetData() []byte {
@@ -3214,7 +3360,7 @@ type TransferLeadershipRequest struct {
 
 func (x *TransferLeadershipRequest) Reset() {
 	*x = TransferLeadershipRequest{}
-	mi := &file_botmanager_proto_msgTypes[48]
+	mi := &file_botmanager_proto_msgTypes[50]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3226,7 +3372,7 @@ func (x *TransferLeadershipRequest) String() string {
 func (*TransferLeadershipRequest) ProtoMessage() {}
 
 func (x *TransferLeadershipRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_botmanager_proto_msgTypes[48]
+	mi := &file_botmanager_proto_msgTypes[50]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3239,7 +3385,7 @@ func (x *TransferLeadershipRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TransferLeadershipRequest.ProtoReflect.Descriptor instead.
 func (*TransferLeadershipRequest) Descriptor() ([]byte, []int) {
-	return file_botmanager_proto_rawDescGZIP(), []int{48}
+	return file_botmanager_proto_rawDescGZIP(), []int{50}
 }
 
 func (x *TransferLeadershipRequest) GetTargetNodeId() string {
@@ -3262,7 +3408,7 @@ type PingTelegramRequest struct {
 
 func (x *PingTelegramRequest) Reset() {
 	*x = PingTelegramRequest{}
-	mi := &file_botmanager_proto_msgTypes[49]
+	mi := &file_botmanager_proto_msgTypes[51]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3274,7 +3420,7 @@ func (x *PingTelegramRequest) String() string {
 func (*PingTelegramRequest) ProtoMessage() {}
 
 func (x *PingTelegramRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_botmanager_proto_msgTypes[49]
+	mi := &file_botmanager_proto_msgTypes[51]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3287,7 +3433,7 @@ func (x *PingTelegramRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PingTelegramRequest.ProtoReflect.Descriptor instead.
 func (*PingTelegramRequest) Descriptor() ([]byte, []int) {
-	return file_botmanager_proto_rawDescGZIP(), []int{49}
+	return file_botmanager_proto_rawDescGZIP(), []int{51}
 }
 
 func (x *PingTelegramRequest) GetBotId() string {
@@ -3313,7 +3459,7 @@ type PingResult struct {
 
 func (x *PingResult) Reset() {
 	*x = PingResult{}
-	mi := &file_botmanager_proto_msgTypes[50]
+	mi := &file_botmanager_proto_msgTypes[52]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3325,7 +3471,7 @@ func (x *PingResult) String() string {
 func (*PingResult) ProtoMessage() {}
 
 func (x *PingResult) ProtoReflect() protoreflect.Message {
-	mi := &file_botmanager_proto_msgTypes[50]
+	mi := &file_botmanager_proto_msgTypes[52]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3338,7 +3484,7 @@ func (x *PingResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PingResult.ProtoReflect.Descriptor instead.
 func (*PingResult) Descriptor() ([]byte, []int) {
-	return file_botmanager_proto_rawDescGZIP(), []int{50}
+	return file_botmanager_proto_rawDescGZIP(), []int{52}
 }
 
 func (x *PingResult) GetSuccess() bool {
@@ -3537,9 +3683,11 @@ const file_botmanager_proto_rawDesc = "" +
 	"page_token\x18\x05 \x01(\tR\tpageToken\x12=\n" +
 	"\fcreated_from\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\vcreatedFrom\x129\n" +
 	"\n" +
-	"created_to\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedTo\"+\n" +
+	"created_to\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedTo\"j\n" +
 	"\x10SubscribeRequest\x12\x17\n" +
-	"\abot_ids\x18\x01 \x03(\tR\x06botIds\"\xd3\x01\n" +
+	"\abot_ids\x18\x01 \x03(\tR\x06botIds\x12*\n" +
+	"\x0eafter_sequence\x18\x02 \x01(\x04H\x00R\rafterSequence\x88\x01\x01B\x11\n" +
+	"\x0f_after_sequence\"\xd3\x01\n" +
 	"\x0fIncomingMessage\x12\x15\n" +
 	"\x06bot_id\x18\x01 \x01(\tR\x05botId\x12\x17\n" +
 	"\achat_id\x18\x02 \x01(\x03R\x06chatId\x12\x1d\n" +
@@ -3570,27 +3718,36 @@ const file_botmanager_proto_rawDesc = "" +
 	"\x06bot_id\x18\x01 \x01(\tR\x05botId\x12-\n" +
 	"\x05state\x18\x02 \x01(\x0e2\x17.botmanager.v1.BotStateR\x05state\x12@\n" +
 	"\rfailure_class\x18\x03 \x01(\x0e2\x1b.botmanager.v1.FailureClassR\ffailureClass\x12\x16\n" +
-	"\x06reason\x18\x04 \x01(\tR\x06reason\"\xe3\x03\n" +
+	"\x06reason\x18\x04 \x01(\tR\x06reason\"\xff\x03\n" +
 	"\x06Update\x12;\n" +
 	"\voccurred_at\x18\x01 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
-	"occurredAt\x12K\n" +
+	"occurredAt\x12\x1a\n" +
+	"\bsequence\x18\a \x01(\x04R\bsequence\x12K\n" +
 	"\x10incoming_message\x18\x02 \x01(\v2\x1e.botmanager.v1.IncomingMessageH\x00R\x0fincomingMessage\x12E\n" +
 	"\x0ecallback_query\x18\x03 \x01(\v2\x1c.botmanager.v1.CallbackQueryH\x00R\rcallbackQuery\x12[\n" +
 	"\x16message_status_changed\x18\x04 \x01(\v2#.botmanager.v1.MessageStatusChangedH\x00R\x14messageStatusChanged\x12R\n" +
 	"\x13chat_member_changed\x18\x05 \x01(\v2 .botmanager.v1.ChatMemberChangedH\x00R\x11chatMemberChanged\x12L\n" +
 	"\x11bot_state_changed\x18\x06 \x01(\v2\x1e.botmanager.v1.BotStateChangedH\x00R\x0fbotStateChangedB\t\n" +
-	"\apayload\"\x85\x01\n" +
+	"\apayload\"\xcb\x01\n" +
 	"\n" +
 	"NodeStatus\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1b\n" +
 	"\tis_leader\x18\x02 \x01(\bR\bisLeader\x12\x1c\n" +
 	"\treachable\x18\x03 \x01(\bR\treachable\x12#\n" +
-	"\rproxy_healthy\x18\x04 \x01(\bR\fproxyHealthy\"\x85\x01\n" +
+	"\rproxy_healthy\x18\x04 \x01(\bR\fproxyHealthy\x12!\n" +
+	"\fraft_address\x18\x05 \x01(\tR\vraftAddress\x12!\n" +
+	"\fgrpc_address\x18\x06 \x01(\tR\vgrpcAddress\"\x85\x01\n" +
 	"\rClusterStatus\x12\x1b\n" +
 	"\tleader_id\x18\x01 \x01(\tR\bleaderId\x12/\n" +
 	"\x05nodes\x18\x02 \x03(\v2\x19.botmanager.v1.NodeStatusR\x05nodes\x12&\n" +
 	"\x04bots\x18\x03 \x03(\v2\x12.botmanager.v1.BotR\x04bots\"\x14\n" +
-	"\x12ExportStateRequest\"\x1b\n" +
+	"\x12ExportStateRequest\"o\n" +
+	"\x0eAddNodeRequest\x12\x17\n" +
+	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12!\n" +
+	"\fraft_address\x18\x02 \x01(\tR\vraftAddress\x12!\n" +
+	"\fgrpc_address\x18\x03 \x01(\tR\vgrpcAddress\",\n" +
+	"\x11RemoveNodeRequest\x12\x17\n" +
+	"\anode_id\x18\x01 \x01(\tR\x06nodeId\"\x1b\n" +
 	"\x05Chunk\x12\x12\n" +
 	"\x04data\x18\x01 \x01(\fR\x04data\"A\n" +
 	"\x19TransferLeadershipRequest\x12$\n" +
@@ -3655,12 +3812,15 @@ const file_botmanager_proto_rawDesc = "" +
 	"GetMessage\x12 .botmanager.v1.GetMessageRequest\x1a\x16.botmanager.v1.Message\x12L\n" +
 	"\vGetMessages\x12!.botmanager.v1.GetMessagesRequest\x1a\x1a.botmanager.v1.MessageList\x12N\n" +
 	"\fListMessages\x12\".botmanager.v1.ListMessagesRequest\x1a\x1a.botmanager.v1.MessageList\x12E\n" +
-	"\tSubscribe\x12\x1f.botmanager.v1.SubscribeRequest\x1a\x15.botmanager.v1.Update0\x012\xcc\x02\n" +
+	"\tSubscribe\x12\x1f.botmanager.v1.SubscribeRequest\x1a\x15.botmanager.v1.Update0\x012\xe2\x03\n" +
 	"\vMaintenance\x12F\n" +
 	"\x10GetClusterStatus\x12\x14.botmanager.v1.Empty\x1a\x1c.botmanager.v1.ClusterStatus\x12H\n" +
 	"\vExportState\x12!.botmanager.v1.ExportStateRequest\x1a\x14.botmanager.v1.Chunk0\x01\x12\\\n" +
 	"\x12TransferLeadership\x12(.botmanager.v1.TransferLeadershipRequest\x1a\x1c.botmanager.v1.ClusterStatus\x12M\n" +
-	"\fPingTelegram\x12\".botmanager.v1.PingTelegramRequest\x1a\x19.botmanager.v1.PingResultB3Z1github.com/h5vx/botmanager/proto/gen;botmanagerpbb\x06proto3"
+	"\fPingTelegram\x12\".botmanager.v1.PingTelegramRequest\x1a\x19.botmanager.v1.PingResult\x12F\n" +
+	"\aAddNode\x12\x1d.botmanager.v1.AddNodeRequest\x1a\x1c.botmanager.v1.ClusterStatus\x12L\n" +
+	"\n" +
+	"RemoveNode\x12 .botmanager.v1.RemoveNodeRequest\x1a\x1c.botmanager.v1.ClusterStatusB:Z8github.com/h5vx/botmanager/api/botmanagerpb;botmanagerpbb\x06proto3"
 
 var (
 	file_botmanager_proto_rawDescOnce sync.Once
@@ -3675,7 +3835,7 @@ func file_botmanager_proto_rawDescGZIP() []byte {
 }
 
 var file_botmanager_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
-var file_botmanager_proto_msgTypes = make([]protoimpl.MessageInfo, 51)
+var file_botmanager_proto_msgTypes = make([]protoimpl.MessageInfo, 53)
 var file_botmanager_proto_goTypes = []any{
 	(BotState)(0),                      // 0: botmanager.v1.BotState
 	(Priority)(0),                      // 1: botmanager.v1.Priority
@@ -3728,30 +3888,32 @@ var file_botmanager_proto_goTypes = []any{
 	(*NodeStatus)(nil),                 // 48: botmanager.v1.NodeStatus
 	(*ClusterStatus)(nil),              // 49: botmanager.v1.ClusterStatus
 	(*ExportStateRequest)(nil),         // 50: botmanager.v1.ExportStateRequest
-	(*Chunk)(nil),                      // 51: botmanager.v1.Chunk
-	(*TransferLeadershipRequest)(nil),  // 52: botmanager.v1.TransferLeadershipRequest
-	(*PingTelegramRequest)(nil),        // 53: botmanager.v1.PingTelegramRequest
-	(*PingResult)(nil),                 // 54: botmanager.v1.PingResult
-	(*timestamppb.Timestamp)(nil),      // 55: google.protobuf.Timestamp
+	(*AddNodeRequest)(nil),             // 51: botmanager.v1.AddNodeRequest
+	(*RemoveNodeRequest)(nil),          // 52: botmanager.v1.RemoveNodeRequest
+	(*Chunk)(nil),                      // 53: botmanager.v1.Chunk
+	(*TransferLeadershipRequest)(nil),  // 54: botmanager.v1.TransferLeadershipRequest
+	(*PingTelegramRequest)(nil),        // 55: botmanager.v1.PingTelegramRequest
+	(*PingResult)(nil),                 // 56: botmanager.v1.PingResult
+	(*timestamppb.Timestamp)(nil),      // 57: google.protobuf.Timestamp
 }
 var file_botmanager_proto_depIdxs = []int32{
 	0,  // 0: botmanager.v1.Bot.state:type_name -> botmanager.v1.BotState
 	5,  // 1: botmanager.v1.Bot.proxy:type_name -> botmanager.v1.ProxyConfig
-	55, // 2: botmanager.v1.Bot.created_at:type_name -> google.protobuf.Timestamp
-	55, // 3: botmanager.v1.Bot.updated_at:type_name -> google.protobuf.Timestamp
+	57, // 2: botmanager.v1.Bot.created_at:type_name -> google.protobuf.Timestamp
+	57, // 3: botmanager.v1.Bot.updated_at:type_name -> google.protobuf.Timestamp
 	3,  // 4: botmanager.v1.Bot.last_failure_class:type_name -> botmanager.v1.FailureClass
 	2,  // 5: botmanager.v1.DeliveryInfo.status:type_name -> botmanager.v1.DeliveryStatus
-	55, // 6: botmanager.v1.DeliveryInfo.next_retry_at:type_name -> google.protobuf.Timestamp
-	55, // 7: botmanager.v1.DeliveryInfo.sent_at:type_name -> google.protobuf.Timestamp
+	57, // 6: botmanager.v1.DeliveryInfo.next_retry_at:type_name -> google.protobuf.Timestamp
+	57, // 7: botmanager.v1.DeliveryInfo.sent_at:type_name -> google.protobuf.Timestamp
 	8,  // 8: botmanager.v1.Message.delivery:type_name -> botmanager.v1.DeliveryInfo
 	1,  // 9: botmanager.v1.Message.priority:type_name -> botmanager.v1.Priority
-	55, // 10: botmanager.v1.Message.created_at:type_name -> google.protobuf.Timestamp
+	57, // 10: botmanager.v1.Message.created_at:type_name -> google.protobuf.Timestamp
 	5,  // 11: botmanager.v1.CreateBotRequest.proxy:type_name -> botmanager.v1.ProxyConfig
 	5,  // 12: botmanager.v1.UpdateBotRequest.proxy:type_name -> botmanager.v1.ProxyConfig
 	0,  // 13: botmanager.v1.SetBotStateRequest.state:type_name -> botmanager.v1.BotState
 	6,  // 14: botmanager.v1.BotList.bots:type_name -> botmanager.v1.Bot
 	19, // 15: botmanager.v1.ChatList.chats:type_name -> botmanager.v1.ChatSummary
-	55, // 16: botmanager.v1.VerifyInitDataResult.auth_date:type_name -> google.protobuf.Timestamp
+	57, // 16: botmanager.v1.VerifyInitDataResult.auth_date:type_name -> google.protobuf.Timestamp
 	1,  // 17: botmanager.v1.SendRequest.priority:type_name -> botmanager.v1.Priority
 	25, // 18: botmanager.v1.SendRequest.buttons:type_name -> botmanager.v1.InlineButton
 	2,  // 19: botmanager.v1.SendAck.status:type_name -> botmanager.v1.DeliveryStatus
@@ -3759,13 +3921,13 @@ var file_botmanager_proto_depIdxs = []int32{
 	27, // 21: botmanager.v1.SendBatchAck.acks:type_name -> botmanager.v1.SendAck
 	9,  // 22: botmanager.v1.MessageList.messages:type_name -> botmanager.v1.Message
 	2,  // 23: botmanager.v1.ListMessagesRequest.status:type_name -> botmanager.v1.DeliveryStatus
-	55, // 24: botmanager.v1.ListMessagesRequest.created_from:type_name -> google.protobuf.Timestamp
-	55, // 25: botmanager.v1.ListMessagesRequest.created_to:type_name -> google.protobuf.Timestamp
-	55, // 26: botmanager.v1.IncomingMessage.received_at:type_name -> google.protobuf.Timestamp
+	57, // 24: botmanager.v1.ListMessagesRequest.created_from:type_name -> google.protobuf.Timestamp
+	57, // 25: botmanager.v1.ListMessagesRequest.created_to:type_name -> google.protobuf.Timestamp
+	57, // 26: botmanager.v1.IncomingMessage.received_at:type_name -> google.protobuf.Timestamp
 	8,  // 27: botmanager.v1.MessageStatusChanged.delivery:type_name -> botmanager.v1.DeliveryInfo
 	0,  // 28: botmanager.v1.BotStateChanged.state:type_name -> botmanager.v1.BotState
 	3,  // 29: botmanager.v1.BotStateChanged.failure_class:type_name -> botmanager.v1.FailureClass
-	55, // 30: botmanager.v1.Update.occurred_at:type_name -> google.protobuf.Timestamp
+	57, // 30: botmanager.v1.Update.occurred_at:type_name -> google.protobuf.Timestamp
 	42, // 31: botmanager.v1.Update.incoming_message:type_name -> botmanager.v1.IncomingMessage
 	43, // 32: botmanager.v1.Update.callback_query:type_name -> botmanager.v1.CallbackQuery
 	44, // 33: botmanager.v1.Update.message_status_changed:type_name -> botmanager.v1.MessageStatusChanged
@@ -3797,36 +3959,40 @@ var file_botmanager_proto_depIdxs = []int32{
 	41, // 59: botmanager.v1.Messaging.Subscribe:input_type -> botmanager.v1.SubscribeRequest
 	4,  // 60: botmanager.v1.Maintenance.GetClusterStatus:input_type -> botmanager.v1.Empty
 	50, // 61: botmanager.v1.Maintenance.ExportState:input_type -> botmanager.v1.ExportStateRequest
-	52, // 62: botmanager.v1.Maintenance.TransferLeadership:input_type -> botmanager.v1.TransferLeadershipRequest
-	53, // 63: botmanager.v1.Maintenance.PingTelegram:input_type -> botmanager.v1.PingTelegramRequest
-	6,  // 64: botmanager.v1.BotAdmin.CreateBot:output_type -> botmanager.v1.Bot
-	6,  // 65: botmanager.v1.BotAdmin.UpdateBot:output_type -> botmanager.v1.Bot
-	6,  // 66: botmanager.v1.BotAdmin.SetBotState:output_type -> botmanager.v1.Bot
-	4,  // 67: botmanager.v1.BotAdmin.DeleteBot:output_type -> botmanager.v1.Empty
-	15, // 68: botmanager.v1.BotAdmin.ListBots:output_type -> botmanager.v1.BotList
-	6,  // 69: botmanager.v1.BotAdmin.GetBot:output_type -> botmanager.v1.Bot
-	7,  // 70: botmanager.v1.BotAdmin.GetChat:output_type -> botmanager.v1.Chat
-	22, // 71: botmanager.v1.BotAdmin.VerifyInitData:output_type -> botmanager.v1.VerifyInitDataResult
-	20, // 72: botmanager.v1.BotAdmin.ListChats:output_type -> botmanager.v1.ChatList
-	24, // 73: botmanager.v1.BotAdmin.GetUserProfilePhoto:output_type -> botmanager.v1.GetUserProfilePhotoResult
-	27, // 74: botmanager.v1.Messaging.Send:output_type -> botmanager.v1.SendAck
-	29, // 75: botmanager.v1.Messaging.SendBatch:output_type -> botmanager.v1.SendBatchAck
-	27, // 76: botmanager.v1.Messaging.EditMessage:output_type -> botmanager.v1.SendAck
-	4,  // 77: botmanager.v1.Messaging.DeleteMessage:output_type -> botmanager.v1.Empty
-	4,  // 78: botmanager.v1.Messaging.PinMessage:output_type -> botmanager.v1.Empty
-	4,  // 79: botmanager.v1.Messaging.UnpinMessage:output_type -> botmanager.v1.Empty
-	35, // 80: botmanager.v1.Messaging.CancelPending:output_type -> botmanager.v1.CancelAck
-	4,  // 81: botmanager.v1.Messaging.AnswerCallback:output_type -> botmanager.v1.Empty
-	9,  // 82: botmanager.v1.Messaging.GetMessage:output_type -> botmanager.v1.Message
-	39, // 83: botmanager.v1.Messaging.GetMessages:output_type -> botmanager.v1.MessageList
-	39, // 84: botmanager.v1.Messaging.ListMessages:output_type -> botmanager.v1.MessageList
-	47, // 85: botmanager.v1.Messaging.Subscribe:output_type -> botmanager.v1.Update
-	49, // 86: botmanager.v1.Maintenance.GetClusterStatus:output_type -> botmanager.v1.ClusterStatus
-	51, // 87: botmanager.v1.Maintenance.ExportState:output_type -> botmanager.v1.Chunk
-	49, // 88: botmanager.v1.Maintenance.TransferLeadership:output_type -> botmanager.v1.ClusterStatus
-	54, // 89: botmanager.v1.Maintenance.PingTelegram:output_type -> botmanager.v1.PingResult
-	64, // [64:90] is the sub-list for method output_type
-	38, // [38:64] is the sub-list for method input_type
+	54, // 62: botmanager.v1.Maintenance.TransferLeadership:input_type -> botmanager.v1.TransferLeadershipRequest
+	55, // 63: botmanager.v1.Maintenance.PingTelegram:input_type -> botmanager.v1.PingTelegramRequest
+	51, // 64: botmanager.v1.Maintenance.AddNode:input_type -> botmanager.v1.AddNodeRequest
+	52, // 65: botmanager.v1.Maintenance.RemoveNode:input_type -> botmanager.v1.RemoveNodeRequest
+	6,  // 66: botmanager.v1.BotAdmin.CreateBot:output_type -> botmanager.v1.Bot
+	6,  // 67: botmanager.v1.BotAdmin.UpdateBot:output_type -> botmanager.v1.Bot
+	6,  // 68: botmanager.v1.BotAdmin.SetBotState:output_type -> botmanager.v1.Bot
+	4,  // 69: botmanager.v1.BotAdmin.DeleteBot:output_type -> botmanager.v1.Empty
+	15, // 70: botmanager.v1.BotAdmin.ListBots:output_type -> botmanager.v1.BotList
+	6,  // 71: botmanager.v1.BotAdmin.GetBot:output_type -> botmanager.v1.Bot
+	7,  // 72: botmanager.v1.BotAdmin.GetChat:output_type -> botmanager.v1.Chat
+	22, // 73: botmanager.v1.BotAdmin.VerifyInitData:output_type -> botmanager.v1.VerifyInitDataResult
+	20, // 74: botmanager.v1.BotAdmin.ListChats:output_type -> botmanager.v1.ChatList
+	24, // 75: botmanager.v1.BotAdmin.GetUserProfilePhoto:output_type -> botmanager.v1.GetUserProfilePhotoResult
+	27, // 76: botmanager.v1.Messaging.Send:output_type -> botmanager.v1.SendAck
+	29, // 77: botmanager.v1.Messaging.SendBatch:output_type -> botmanager.v1.SendBatchAck
+	27, // 78: botmanager.v1.Messaging.EditMessage:output_type -> botmanager.v1.SendAck
+	4,  // 79: botmanager.v1.Messaging.DeleteMessage:output_type -> botmanager.v1.Empty
+	4,  // 80: botmanager.v1.Messaging.PinMessage:output_type -> botmanager.v1.Empty
+	4,  // 81: botmanager.v1.Messaging.UnpinMessage:output_type -> botmanager.v1.Empty
+	35, // 82: botmanager.v1.Messaging.CancelPending:output_type -> botmanager.v1.CancelAck
+	4,  // 83: botmanager.v1.Messaging.AnswerCallback:output_type -> botmanager.v1.Empty
+	9,  // 84: botmanager.v1.Messaging.GetMessage:output_type -> botmanager.v1.Message
+	39, // 85: botmanager.v1.Messaging.GetMessages:output_type -> botmanager.v1.MessageList
+	39, // 86: botmanager.v1.Messaging.ListMessages:output_type -> botmanager.v1.MessageList
+	47, // 87: botmanager.v1.Messaging.Subscribe:output_type -> botmanager.v1.Update
+	49, // 88: botmanager.v1.Maintenance.GetClusterStatus:output_type -> botmanager.v1.ClusterStatus
+	53, // 89: botmanager.v1.Maintenance.ExportState:output_type -> botmanager.v1.Chunk
+	49, // 90: botmanager.v1.Maintenance.TransferLeadership:output_type -> botmanager.v1.ClusterStatus
+	56, // 91: botmanager.v1.Maintenance.PingTelegram:output_type -> botmanager.v1.PingResult
+	49, // 92: botmanager.v1.Maintenance.AddNode:output_type -> botmanager.v1.ClusterStatus
+	49, // 93: botmanager.v1.Maintenance.RemoveNode:output_type -> botmanager.v1.ClusterStatus
+	66, // [66:94] is the sub-list for method output_type
+	38, // [38:66] is the sub-list for method input_type
 	38, // [38:38] is the sub-list for extension type_name
 	38, // [38:38] is the sub-list for extension extendee
 	0,  // [0:38] is the sub-list for field type_name
@@ -3840,6 +4006,7 @@ func file_botmanager_proto_init() {
 	file_botmanager_proto_msgTypes[7].OneofWrappers = []any{}
 	file_botmanager_proto_msgTypes[18].OneofWrappers = []any{}
 	file_botmanager_proto_msgTypes[22].OneofWrappers = []any{}
+	file_botmanager_proto_msgTypes[37].OneofWrappers = []any{}
 	file_botmanager_proto_msgTypes[43].OneofWrappers = []any{
 		(*Update_IncomingMessage)(nil),
 		(*Update_CallbackQuery)(nil),
@@ -3853,7 +4020,7 @@ func file_botmanager_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_botmanager_proto_rawDesc), len(file_botmanager_proto_rawDesc)),
 			NumEnums:      4,
-			NumMessages:   51,
+			NumMessages:   53,
 			NumExtensions: 0,
 			NumServices:   3,
 		},

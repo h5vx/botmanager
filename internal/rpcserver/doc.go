@@ -28,31 +28,30 @@
 //     a live Telegram call the same way GetChat does, keyed off the
 //     message's/request's bot_id — see CLAUDE.md for the note on
 //     AnswerCallbackRequest.bot_id. GetMessage/GetMessages/ListMessages are plain reads.
-//     Subscribe merges internal/telegram.UpdateBus (incoming_message/
-//     callback_query/chat_member_changed) with raftcluster.Node.SubscribeEvents
-//     (message_status_changed/bot_state_changed) into one stream, filtered
-//     by SubscribeRequest.bot_ids.
+//     Subscribe streams the replicated journal (raftcluster.JournalEntry)
+//     — Telegram updates and status changes alike — filtered by
+//     SubscribeRequest.bot_ids and resumable with after_sequence; every
+//     node can serve it.
 //   - MaintenanceServer (maintenance.go): GetClusterStatus reads Raft's
 //     own configuration/leader (Node.Configuration/LeaderID) rather than
 //     hardcoding a single node, so the same code keeps working once a
-//     real multi-node deployment exists. ExportState streams
-//     Node.ExportSnapshot's JSON output in bounded chunks.
+//     real multi-node deployment exists, with addresses from the node
+//     registry and a real grpc.health.v1 probe of every peer. ExportState
+//     streams Node.ExportSnapshot's JSON output in bounded chunks.
+//     AddNode/RemoveNode change cluster membership.
 //
-// # Leadership — deliberately not retransmitted
+// # Leadership — writes are forwarded to the leader
 //
-// The cluster is single-node for now (no configuration carries peer
-// gRPC addresses to retransmit a write to). Every RPC that calls
-// Node.Apply checks Node.IsLeader() first (requireLeader in leader.go) and
-// returns codes.FailedPrecondition naming the current leader address
-// (Node.LeaderAddr/LeaderID), or codes.Unavailable if no leader is known
-// yet, instead of silently failing inside Apply or forwarding the call
-// itself. Read-only RPCs (GetBot, ListBots, GetMessage, ListMessages,
-// GetClusterStatus, and every RPC that only makes a live Telegram call
-// without touching raft — GetChat, EditMessage, DeleteMessage, PinMessage,
-// UnpinMessage, AnswerCallback) have no such restriction: they work on any
-// node, replica included, since they never call Apply. Building real
-// retransmission (dialing the current leader's own gRPC BotAdmin/Messaging
-// as a client and forwarding the request) is future work that needs a
-// peer address list this configuration does not have yet — see
-// CLAUDE.md.
+// Forwarder (forward.go) is a unary server interceptor: a write RPC
+// (writeMethods) received by a follower is sent on to the current leader's
+// gRPC address, taken from the replicated node registry, over a connection
+// authenticated with this node's own certificate, and the leader's answer
+// is returned as-is. A request already forwarded once is never forwarded
+// again (metadata marker) — if leadership moved in between, it fails with
+// UNAVAILABLE and the client retries. Without a known leader the answer is
+// UNAVAILABLE as well. Every RPC that calls Node.Apply additionally checks
+// leadership itself (requireLeader in leader.go), so a server built
+// without the Forwarder answers FAILED_PRECONDITION naming the leader.
+// Reads, live Telegram calls and Subscribe are served by whichever node
+// receives them.
 package rpcserver

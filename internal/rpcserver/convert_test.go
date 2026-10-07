@@ -8,9 +8,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/h5vx/botmanager/api/botmanagerpb"
 	"github.com/h5vx/botmanager/internal/raftcluster"
-	"github.com/h5vx/botmanager/internal/telegram"
-	botmanagerpb "github.com/h5vx/botmanager/proto/gen"
 )
 
 func TestChatMemberRights(t *testing.T) {
@@ -44,8 +43,8 @@ func TestChatMemberStatusIsMember(t *testing.T) {
 		"left": false, "kicked": false, "member": true, "administrator": true, "creator": true, "": false,
 	}
 	for status, want := range cases {
-		if got := chatMemberStatusIsMember(status); got != want {
-			t.Errorf("chatMemberStatusIsMember(%q) = %v, want %v", status, got, want)
+		if got := raftcluster.ChatMemberStatusIsMember(status); got != want {
+			t.Errorf("ChatMemberStatusIsMember(%q) = %v, want %v", status, got, want)
 		}
 	}
 }
@@ -92,31 +91,44 @@ func TestBotIDFilterSet(t *testing.T) {
 	}
 }
 
-func TestTelegramUpdateToProto(t *testing.T) {
+func TestJournalEntryToProto(t *testing.T) {
 	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
 
-	msg := telegramUpdateToProto(telegram.Update{
-		Kind: telegram.UpdateKindIncomingMessage, BotID: "b1", ChatID: 1, MessageID: 2, FromUserID: 3,
-		Text: "hi", ReceivedAt: now,
+	msg := journalEntryToProto(raftcluster.JournalEntry{
+		Seq: 7, Kind: raftcluster.JournalIncomingMessage, BotID: "b1", OccurredAt: now,
+		Update: &raftcluster.IncomingUpdate{ChatID: 1, MessageID: 2, FromUserID: 3, Text: "hi", ReceivedAt: now},
 	})
 	im := msg.GetIncomingMessage()
-	if im == nil || im.GetBotId() != "b1" || im.GetText() != "hi" || !msg.GetOccurredAt().AsTime().Equal(now) {
+	if im == nil || im.GetBotId() != "b1" || im.GetText() != "hi" || !msg.GetOccurredAt().AsTime().Equal(now) || msg.GetSequence() != 7 {
 		t.Fatalf("incoming_message = %+v", msg)
 	}
 
-	cb := telegramUpdateToProto(telegram.Update{
-		Kind: telegram.UpdateKindCallbackQuery, BotID: "b1", CallbackQueryID: "cq1", CallbackData: "data",
-		ChatID: 1, MessageID: 2, FromUserID: 3, ReceivedAt: now,
+	cb := journalEntryToProto(raftcluster.JournalEntry{
+		Seq: 8, Kind: raftcluster.JournalCallbackQuery, BotID: "b1",
+		Update: &raftcluster.IncomingUpdate{CallbackQueryID: "cq1", CallbackData: "data", ChatID: 1, MessageID: 2, FromUserID: 3},
 	})
 	if cb.GetCallbackQuery() == nil || cb.GetCallbackQuery().GetCallbackQueryId() != "cq1" {
 		t.Fatalf("callback_query = %+v", cb)
 	}
 
-	cm := telegramUpdateToProto(telegram.Update{
-		Kind: telegram.UpdateKindChatMemberChanged, BotID: "b1", ChatID: 1, NewChatMemberStatus: "left", ReceivedAt: now,
+	cm := journalEntryToProto(raftcluster.JournalEntry{
+		Seq: 9, Kind: raftcluster.JournalChatMemberChanged, BotID: "b1",
+		Update: &raftcluster.IncomingUpdate{ChatID: 1, NewChatMemberStatus: "left"},
 	})
 	if cm.GetChatMemberChanged() == nil || cm.GetChatMemberChanged().GetBotIsMember() {
 		t.Fatalf("chat_member_changed = %+v", cm)
+	}
+
+	st := journalEntryToProto(raftcluster.JournalEntry{
+		Seq: 10, Kind: raftcluster.JournalBotStateChanged, BotID: "b1",
+		BotState: &raftcluster.BotStateChange{State: raftcluster.BotStateBroken, FailureClass: raftcluster.FailureClassBot, Reason: "401"},
+	})
+	if bs := st.GetBotStateChanged(); bs == nil || bs.GetState() != botmanagerpb.BotState_BOT_STATE_BROKEN || bs.GetReason() != "401" {
+		t.Fatalf("bot_state_changed = %+v", st)
+	}
+
+	if journalEntryToProto(raftcluster.JournalEntry{Kind: raftcluster.JournalIncomingMessage}) != nil {
+		t.Fatalf("entry without payload must convert to nil")
 	}
 }
 
@@ -167,38 +179,5 @@ func TestButtonsFromProto_CallbackDataTooLong(t *testing.T) {
 	_, err := buttonsFromProto([]*botmanagerpb.InlineButton{{Text: "Буду", CallbackData: data}})
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("err = %v, want InvalidArgument", err)
-	}
-}
-
-func TestFsmEventToProto(t *testing.T) {
-	msgEvent := raftcluster.Event{
-		Command: raftcluster.CommandPutMessage,
-		Message: &raftcluster.Message{IdempotencyKey: "k1", BotID: "b1", Delivery: raftcluster.DeliveryInfo{Status: raftcluster.DeliveryStatusPending}},
-	}
-	botID, out := fsmEventToProto(msgEvent)
-	if botID != "b1" || out.GetMessageStatusChanged() == nil || out.GetMessageStatusChanged().GetIdempotencyKey() != "k1" {
-		t.Fatalf("put_message event = %q, %+v", botID, out)
-	}
-
-	botEvent := raftcluster.Event{
-		Command: raftcluster.CommandSetBotState,
-		Bot:     &raftcluster.Bot{ID: "b1", State: raftcluster.BotStateBroken, LastFailureClass: raftcluster.FailureClassBot, LastFailureReason: "401"},
-	}
-	botID, out = fsmEventToProto(botEvent)
-	if botID != "b1" || out.GetBotStateChanged() == nil || out.GetBotStateChanged().GetState() != botmanagerpb.BotState_BOT_STATE_BROKEN {
-		t.Fatalf("set_bot_state event = %q, %+v", botID, out)
-	}
-
-	// CommandCreateBot/CommandUpdateBot are deliberately not translated
-	// (see messaging.go's doc comment on Subscribe).
-	createEvent := raftcluster.Event{Command: raftcluster.CommandCreateBot, Bot: &raftcluster.Bot{ID: "b1"}}
-	if _, out := fsmEventToProto(createEvent); out != nil {
-		t.Fatalf("create_bot event should not translate to an Update, got %+v", out)
-	}
-
-	// A nil Message/Bot (should not happen for a real successfully-applied
-	// event, but fsmEventToProto must not panic) yields no Update.
-	if _, out := fsmEventToProto(raftcluster.Event{Command: raftcluster.CommandPutMessage}); out != nil {
-		t.Fatalf("nil Message should yield no Update, got %+v", out)
 	}
 }

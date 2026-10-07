@@ -1010,6 +1010,8 @@ const (
 	Maintenance_ExportState_FullMethodName        = "/botmanager.v1.Maintenance/ExportState"
 	Maintenance_TransferLeadership_FullMethodName = "/botmanager.v1.Maintenance/TransferLeadership"
 	Maintenance_PingTelegram_FullMethodName       = "/botmanager.v1.Maintenance/PingTelegram"
+	Maintenance_AddNode_FullMethodName            = "/botmanager.v1.Maintenance/AddNode"
+	Maintenance_RemoveNode_FullMethodName         = "/botmanager.v1.Maintenance/RemoveNode"
 )
 
 // MaintenanceClient is the client API for Maintenance service.
@@ -1021,14 +1023,17 @@ type MaintenanceClient interface {
 	// TransferLeadership назначает мастером конкретный узел
 	// поверх штатной передачи лидерства Raft (RaftCluster.LeadershipTransferToServer),
 	// не самодельных выборов. NOT_FOUND — узел неизвестен кластеру,
-	// FAILED_PRECONDITION — вызов пришёл не на лидера (с указанием текущего
-	// лидера), UNAVAILABLE — передача не удалась.
+	// UNAVAILABLE — передача не удалась.
 	TransferLeadership(ctx context.Context, in *TransferLeadershipRequest, opts ...grpc.CallOption) (*ClusterStatus, error)
 	// PingTelegram проверяет доступность Telegram API со стороны botmanager,
 	// в том числе через настроенный прокси — отвечает на
 	// вопрос "это у нас сеть или у Telegram". Таймаут —
 	// CLAUDE.md, раздел "PingTelegram".
 	PingTelegram(ctx context.Context, in *PingTelegramRequest, opts ...grpc.CallOption) (*PingResult, error)
+	// AddNode/RemoveNode меняют состав Raft-кластера. Как и любая запись,
+	// выполняются на лидере (вызов на другом узле пересылается лидеру).
+	AddNode(ctx context.Context, in *AddNodeRequest, opts ...grpc.CallOption) (*ClusterStatus, error)
+	RemoveNode(ctx context.Context, in *RemoveNodeRequest, opts ...grpc.CallOption) (*ClusterStatus, error)
 }
 
 type maintenanceClient struct {
@@ -1088,6 +1093,26 @@ func (c *maintenanceClient) PingTelegram(ctx context.Context, in *PingTelegramRe
 	return out, nil
 }
 
+func (c *maintenanceClient) AddNode(ctx context.Context, in *AddNodeRequest, opts ...grpc.CallOption) (*ClusterStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ClusterStatus)
+	err := c.cc.Invoke(ctx, Maintenance_AddNode_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *maintenanceClient) RemoveNode(ctx context.Context, in *RemoveNodeRequest, opts ...grpc.CallOption) (*ClusterStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ClusterStatus)
+	err := c.cc.Invoke(ctx, Maintenance_RemoveNode_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // MaintenanceServer is the server API for Maintenance service.
 // All implementations must embed UnimplementedMaintenanceServer
 // for forward compatibility.
@@ -1097,14 +1122,17 @@ type MaintenanceServer interface {
 	// TransferLeadership назначает мастером конкретный узел
 	// поверх штатной передачи лидерства Raft (RaftCluster.LeadershipTransferToServer),
 	// не самодельных выборов. NOT_FOUND — узел неизвестен кластеру,
-	// FAILED_PRECONDITION — вызов пришёл не на лидера (с указанием текущего
-	// лидера), UNAVAILABLE — передача не удалась.
+	// UNAVAILABLE — передача не удалась.
 	TransferLeadership(context.Context, *TransferLeadershipRequest) (*ClusterStatus, error)
 	// PingTelegram проверяет доступность Telegram API со стороны botmanager,
 	// в том числе через настроенный прокси — отвечает на
 	// вопрос "это у нас сеть или у Telegram". Таймаут —
 	// CLAUDE.md, раздел "PingTelegram".
 	PingTelegram(context.Context, *PingTelegramRequest) (*PingResult, error)
+	// AddNode/RemoveNode меняют состав Raft-кластера. Как и любая запись,
+	// выполняются на лидере (вызов на другом узле пересылается лидеру).
+	AddNode(context.Context, *AddNodeRequest) (*ClusterStatus, error)
+	RemoveNode(context.Context, *RemoveNodeRequest) (*ClusterStatus, error)
 	mustEmbedUnimplementedMaintenanceServer()
 }
 
@@ -1126,6 +1154,12 @@ func (UnimplementedMaintenanceServer) TransferLeadership(context.Context, *Trans
 }
 func (UnimplementedMaintenanceServer) PingTelegram(context.Context, *PingTelegramRequest) (*PingResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method PingTelegram not implemented")
+}
+func (UnimplementedMaintenanceServer) AddNode(context.Context, *AddNodeRequest) (*ClusterStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method AddNode not implemented")
+}
+func (UnimplementedMaintenanceServer) RemoveNode(context.Context, *RemoveNodeRequest) (*ClusterStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method RemoveNode not implemented")
 }
 func (UnimplementedMaintenanceServer) mustEmbedUnimplementedMaintenanceServer() {}
 func (UnimplementedMaintenanceServer) testEmbeddedByValue()                     {}
@@ -1213,6 +1247,42 @@ func _Maintenance_PingTelegram_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Maintenance_AddNode_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AddNodeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MaintenanceServer).AddNode(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Maintenance_AddNode_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MaintenanceServer).AddNode(ctx, req.(*AddNodeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Maintenance_RemoveNode_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RemoveNodeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MaintenanceServer).RemoveNode(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Maintenance_RemoveNode_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MaintenanceServer).RemoveNode(ctx, req.(*RemoveNodeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Maintenance_ServiceDesc is the grpc.ServiceDesc for Maintenance service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1231,6 +1301,14 @@ var Maintenance_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PingTelegram",
 			Handler:    _Maintenance_PingTelegram_Handler,
+		},
+		{
+			MethodName: "AddNode",
+			Handler:    _Maintenance_AddNode_Handler,
+		},
+		{
+			MethodName: "RemoveNode",
+			Handler:    _Maintenance_RemoveNode_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

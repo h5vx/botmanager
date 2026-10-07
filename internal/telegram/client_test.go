@@ -334,18 +334,18 @@ func TestClient_GetUpdates_ParsesMessageCallbackAndChatMember(t *testing.T) {
 		t.Fatalf("got %d updates, want 3", len(updates))
 	}
 
-	msgEv, ok := convertUpdate("bot-1", updates[0])
-	if !ok || msgEv.Kind != UpdateKindIncomingMessage || msgEv.Text != "привет" || msgEv.ChatID != 555 {
+	msgEv, ok := convertUpdate(updates[0])
+	if !ok || msgEv.Kind != raftcluster.JournalIncomingMessage || msgEv.Text != "привет" || msgEv.ChatID != 555 {
 		t.Errorf("updates[0] converted = %+v (ok=%v)", msgEv, ok)
 	}
 
-	cbEv, ok := convertUpdate("bot-1", updates[1])
-	if !ok || cbEv.Kind != UpdateKindCallbackQuery || cbEv.CallbackData != "rsvp:yes" || cbEv.ChatID != 555 {
+	cbEv, ok := convertUpdate(updates[1])
+	if !ok || cbEv.Kind != raftcluster.JournalCallbackQuery || cbEv.CallbackData != "rsvp:yes" || cbEv.ChatID != 555 {
 		t.Errorf("updates[1] converted = %+v (ok=%v)", cbEv, ok)
 	}
 
-	memberEv, ok := convertUpdate("bot-1", updates[2])
-	if !ok || memberEv.Kind != UpdateKindChatMemberChanged || memberEv.NewChatMemberStatus != "kicked" || memberEv.ChatID != 556 {
+	memberEv, ok := convertUpdate(updates[2])
+	if !ok || memberEv.Kind != raftcluster.JournalChatMemberChanged || memberEv.NewChatMemberStatus != "kicked" || memberEv.ChatID != 556 {
 		t.Errorf("updates[2] converted = %+v (ok=%v)", memberEv, ok)
 	}
 }

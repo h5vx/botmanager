@@ -31,17 +31,17 @@ func httpTimeoutOrDefault(d time.Duration) time.Duration {
 
 // requireLeader rejects a write RPC with a precise gRPC error when this
 // node is not the current Raft leader, instead of letting Node.Apply fail
-// with the less specific raftcluster.ErrNotLeader. See doc.go's
-// "Leadership" section: the cluster is single-node for now, so this
-// deliberately does not retransmit the write to the real leader — it names
-// the leader (if known) so the caller can retry there itself.
+// with the less specific raftcluster.ErrNotLeader. With the Forwarder
+// interceptor installed (cmd/botmanager) such a request never reaches the
+// handler on a follower; this is the safety net for servers without it and
+// for the narrow window in which leadership moves (see doc.go).
 func requireLeader(node *raftcluster.Node) error {
 	if node.IsLeader() {
 		return nil
 	}
 	if addr := node.LeaderAddr(); addr != "" {
 		return status.Errorf(codes.FailedPrecondition,
-			"this node is not the raft leader; current leader is node %q at %s — retry this write against it (writes are not forwarded to the leader)",
+			"this node is not the raft leader; current leader is node %q at %s",
 			node.LeaderID(), addr)
 	}
 	return status.Error(codes.Unavailable, "raft leader is not currently known on this node")

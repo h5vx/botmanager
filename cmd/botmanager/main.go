@@ -1,14 +1,15 @@
 // Command botmanager — точка входа сервиса управления Telegram-ботами.
 //
 // Поднимаются:
-//   - Raft-узел (internal/raftcluster), одноузловой bootstrap
-//     (см. internal/raftcluster/doc.go и CLAUDE.md);
+//   - Raft-узел (internal/raftcluster): один узел или кластер из
+//     raft.peers, транспорт поверх mTLS, токены ботов зашифрованы;
 //   - internal/botlifecycle.Manager, запускающий/останавливающий раннеров
 //     ботов (internal/telegram) в зависимости от лидерства и состояния
 //     ботов;
 //   - HTTP-сервер наблюдаемости на :9091 (/healthz, /readyz, /metrics);
 //   - gRPC-сервер на :9090 с BotAdmin/Messaging/Maintenance
-//     (internal/rpcserver), плюс grpc.health.v1 и reflection.
+//     (internal/rpcserver) поверх mTLS, с пересылкой записей лидеру, плюс
+//     grpc.health.v1 и reflection.
 package main
 
 import (
@@ -24,17 +25,20 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
 
+	"github.com/h5vx/botmanager/api/botmanagerpb"
 	"github.com/h5vx/botmanager/internal/botlifecycle"
 	"github.com/h5vx/botmanager/internal/config"
 	"github.com/h5vx/botmanager/internal/observability"
 	"github.com/h5vx/botmanager/internal/raftcluster"
 	"github.com/h5vx/botmanager/internal/rpcserver"
+	"github.com/h5vx/botmanager/internal/security"
 	"github.com/h5vx/botmanager/internal/telegram"
-	botmanagerpb "github.com/h5vx/botmanager/proto/gen"
 )
 
 const serviceName = "botmanager"
@@ -61,13 +65,39 @@ func main() {
 		"http_addr", cfg.HTTP.ListenAddr,
 	)
 
-	node, err := raftcluster.Open(raftcluster.Config{
+	sec, err := loadSecurity(cfg.Security, logger)
+	if err != nil {
+		logger.Error("security setup failed", "event", "botmanager.security_failed", "error", err.Error())
+		os.Exit(1)
+	}
+
+	grpcAdvertise, err := cfg.GRPCAdvertiseAddr()
+	if err != nil {
+		logger.Error("grpc advertise address", "event", "botmanager.config_invalid", "error", err.Error())
+		os.Exit(1)
+	}
+	peers := make([]raftcluster.NodeInfo, 0, len(cfg.Raft.Peers))
+	for _, p := range cfg.Raft.Peers {
+		peers = append(peers, raftcluster.NodeInfo{ID: p.ID, RaftAddr: p.RaftAddr, GRPCAddr: p.GRPCAddr})
+	}
+
+	raftCfg := raftcluster.Config{
 		NodeID:                 cfg.Node.ID,
 		DataDir:                cfg.Node.DataDir,
 		BindAddr:               cfg.Node.RaftBind,
+		AdvertiseAddr:          cfg.Node.RaftAdvertise,
 		Bootstrap:              cfg.Raft.Bootstrap,
 		MessageRetentionPerBot: cfg.Raft.MessageRetentionPerBot,
-	})
+		JournalRetention:       cfg.Raft.JournalRetention,
+		TokenCipher:            sec.cipher,
+		Self:                   raftcluster.NodeInfo{GRPCAddr: grpcAdvertise},
+		KnownPeers:             peers,
+		Logger:                 logger,
+	}
+	if sec.mtls != nil {
+		raftCfg.TLS = &raftcluster.TransportTLS{Server: sec.mtls.Server, Client: sec.mtls.Client}
+	}
+	node, err := raftcluster.Open(raftCfg)
 	if err != nil {
 		logger.Error("raft open failed", "event", "botmanager.raft_open_failed", "error", err.Error())
 		os.Exit(1)
@@ -82,8 +112,7 @@ func main() {
 		SendPollInterval: time.Duration(cfg.Telegram.SendPollIntervalSeconds) * time.Second,
 	}
 
-	bus := telegram.NewInMemoryBus()
-	runnerFactory := telegram.NewRunnerFactory(node, bus, telegramCfg, nodeProxy, logger)
+	runnerFactory := telegram.NewRunnerFactory(node, telegramCfg, nodeProxy, logger)
 	manager := botlifecycle.NewManager(node, runnerFactory, logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -94,7 +123,7 @@ func main() {
 	go manager.Run(managerCtx)
 
 	httpServer := newHTTPServer(cfg.HTTP.ListenAddr, node)
-	grpcServer, grpcListener, err := newGRPCServer(cfg.GRPC.ListenAddr, node, bus, nodeProxy, telegramCfg, logger)
+	grpcServer, grpcListener, forwarder, err := newGRPCServer(cfg.GRPC.ListenAddr, node, sec, nodeProxy, telegramCfg, logger)
 	if err != nil {
 		logger.Error("grpc listen failed", "event", "botmanager.grpc_listen_failed", "error", err.Error())
 		os.Exit(1)
@@ -130,6 +159,7 @@ func main() {
 		logger.Error("http shutdown error", "event", "botmanager.http_shutdown_error", "error", err.Error())
 	}
 	grpcServer.GracefulStop()
+	forwarder.Close()
 
 	// Останавливаем botlifecycle.Manager (и тем самым все раннеры ботов на
 	// этом узле) прежде чем выключать сам Raft-узел — Manager.Run завершает
@@ -150,10 +180,10 @@ func newHTTPServer(addr string, node *raftcluster.Node) *http.Server {
 		// readyz проверяет реальные зависимости, а не только "процесс
 		// жив" (это работа healthz). Единственная зависимость —
 		// собственный Raft-узел: пока у него нет известного лидера (в т.ч.
-		// себя самого — одноузловой bootstrap, см. CLAUDE.md), узел не может ни принять запись
-		// (Node.Apply), ни быть уверенным в собственном состоянии. Сразу
-		// после старта процесса, до завершения самых первых выборов, это
-		// ожидаемо не так — ровно для такого окна readyz и существует.
+		// себя самого), узел не может ни принять запись, ни переслать её
+		// лидеру. Сразу после старта процесса, до завершения первых
+		// выборов, это ожидаемо не так — ровно для такого окна readyz и
+		// существует.
 		if node.LeaderID() == "" {
 			return false, "raft leader not yet known"
 		}
@@ -166,23 +196,70 @@ func newHTTPServer(addr string, node *raftcluster.Node) *http.Server {
 	}
 }
 
-// newGRPCServer собирает gRPC-сервер, слушатель порта и регистрирует
-// BotAdmin/Messaging/Maintenance (internal/rpcserver) поверх node/bus, плюс
-// стандартную grpc.health.v1 службу и reflection.
-func newGRPCServer(addr string, node *raftcluster.Node, bus *telegram.InMemoryBus, nodeProxy raftcluster.ProxyConfig, telegramCfg telegram.Config, logger *slog.Logger) (*grpc.Server, net.Listener, error) {
-	lis, err := net.Listen("tcp", addr)
+// securitySetup is what loadSecurity derives from config: mTLS
+// configurations and the token cipher, both nil in insecure mode.
+type securitySetup struct {
+	mtls   *security.MTLS
+	cipher *raftcluster.TokenCipher
+}
+
+func loadSecurity(cfg config.SecurityConfig, logger *slog.Logger) (securitySetup, error) {
+	if cfg.Insecure {
+		logger.Warn("INSECURE MODE: gRPC and Raft run without TLS or authentication, bot tokens are stored in plaintext — local development only",
+			"event", "botmanager.insecure_mode")
+		return securitySetup{}, nil
+	}
+	m, err := security.LoadMTLS(cfg.CAFile, cfg.CertFile, cfg.KeyFile)
 	if err != nil {
-		return nil, nil, err
+		return securitySetup{}, err
+	}
+	key, err := security.LoadTokenKey(cfg.TokenKeyFile)
+	if err != nil {
+		return securitySetup{}, err
+	}
+	cipher, err := raftcluster.NewTokenCipher(key)
+	if err != nil {
+		return securitySetup{}, err
+	}
+	return securitySetup{mtls: m, cipher: cipher}, nil
+}
+
+// newGRPCServer собирает gRPC-сервер (mTLS, если не insecure-режим),
+// слушатель порта и регистрирует BotAdmin/Messaging/Maintenance
+// (internal/rpcserver) поверх node, плюс стандартную grpc.health.v1 службу
+// и reflection. Записи, пришедшие на не-лидера, пересылаются лидеру
+// (rpcserver.Forwarder) с сертификатом этого узла.
+func newGRPCServer(addr string, node *raftcluster.Node, sec securitySetup, nodeProxy raftcluster.ProxyConfig, telegramCfg telegram.Config, logger *slog.Logger) (*grpc.Server, net.Listener, *rpcserver.Forwarder, error) {
+	serverCreds := insecure.NewCredentials()
+	peerCreds := insecure.NewCredentials()
+	if sec.mtls != nil {
+		serverCreds = credentials.NewTLS(sec.mtls.Server)
+		peerCreds = credentials.NewTLS(sec.mtls.Client)
 	}
 
-	server := grpc.NewServer()
+	forwarder, err := rpcserver.NewForwarder(node, grpc.WithTransportCredentials(peerCreds))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	lis, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	server := grpc.NewServer(
+		grpc.Creds(serverCreds),
+		grpc.ChainUnaryInterceptor(forwarder.UnaryInterceptor),
+	)
 
 	apiBaseURL := telegramCfg.APIBaseURL
 	httpTimeout := telegramCfg.RequestTimeout
 
 	botmanagerpb.RegisterBotAdminServer(server, rpcserver.NewBotAdminServer(node, nodeProxy, apiBaseURL, httpTimeout, logger))
-	botmanagerpb.RegisterMessagingServer(server, rpcserver.NewMessagingServer(node, bus, nodeProxy, apiBaseURL, httpTimeout, logger))
-	botmanagerpb.RegisterMaintenanceServer(server, rpcserver.NewMaintenanceServer(node, nodeProxy, apiBaseURL, httpTimeout, logger))
+	botmanagerpb.RegisterMessagingServer(server, rpcserver.NewMessagingServer(node, nodeProxy, apiBaseURL, httpTimeout, logger))
+	maintenance := rpcserver.NewMaintenanceServer(node, nodeProxy, apiBaseURL, httpTimeout, logger)
+	maintenance.SetPeerDialer(forwarder)
+	botmanagerpb.RegisterMaintenanceServer(server, maintenance)
 
 	healthServer := health.NewServer()
 	healthpb.RegisterHealthServer(server, healthServer)
@@ -190,5 +267,5 @@ func newGRPCServer(addr string, node *raftcluster.Node, bus *telegram.InMemoryBu
 
 	reflection.Register(server)
 
-	return server, lis, nil
+	return server, lis, forwarder, nil
 }

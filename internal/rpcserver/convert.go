@@ -10,8 +10,8 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/h5vx/botmanager/api/botmanagerpb"
 	"github.com/h5vx/botmanager/internal/raftcluster"
-	botmanagerpb "github.com/h5vx/botmanager/proto/gen"
 )
 
 // maxSendButtons — разумный предел числа кнопок в одном ряду (один ряд,
@@ -92,19 +92,6 @@ func timeFromProtoOrZero(ts *timestamppb.Timestamp) time.Time {
 		return time.Time{}
 	}
 	return ts.AsTime()
-}
-
-// timestamppbNow stamps Update.occurred_at for events converted from
-// raftcluster.Event (messaging.go's fsmEventToProto): FSM.Event carries no
-// "when" of its own (Command/Bot/Message only — see fsm.go), and Bot/
-// Message have no generic "last modified" field that would cover every
-// command kind uniformly (Bot.UpdatedAt exists but Message does not have an
-// equivalent). Subscribe's consumer sees each event promptly after Apply
-// commits it, so "now" at conversion time is an accurate-enough
-// approximation of "when this happened" for a live stream — unlike
-// toProtoTime, which threads an actual recorded timestamp through.
-func timestamppbNow() *timestamppb.Timestamp {
-	return timestamppb.New(time.Now().UTC())
 }
 
 // --- enums ---

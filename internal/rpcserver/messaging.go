@@ -8,22 +8,20 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/h5vx/botmanager/api/botmanagerpb"
 	"github.com/h5vx/botmanager/internal/raftcluster"
-	"github.com/h5vx/botmanager/internal/telegram"
-	botmanagerpb "github.com/h5vx/botmanager/proto/gen"
 )
 
 // MessagingServer implements botmanagerpb.MessagingServer. Send/SendBatch/
 // CancelPending go through raftcluster.Node.Apply; EditMessage/
 // DeleteMessage/PinMessage/UnpinMessage/AnswerCallback make a live Telegram
 // call the same way BotAdminServer.GetChat does (see doc.go); GetMessage/
-// GetMessages/ListMessages are plain reads; Subscribe merges
-// telegram.UpdateBus with raftcluster.Node.SubscribeEvents (see doc.go).
+// GetMessages/ListMessages are plain reads; Subscribe streams the
+// replicated journal (messaging_subscribe.go).
 type MessagingServer struct {
 	botmanagerpb.UnimplementedMessagingServer
 
 	node        *raftcluster.Node
-	bus         telegram.UpdateBus
 	nodeProxy   raftcluster.ProxyConfig
 	apiBaseURL  string
 	httpTimeout time.Duration
@@ -35,13 +33,12 @@ type MessagingServer struct {
 // client this server builds for EditMessage/DeleteMessage/PinMessage/
 // UnpinMessage/AnswerCallback follows the exact same construction
 // (telegramClientFor in leader.go).
-func NewMessagingServer(node *raftcluster.Node, bus telegram.UpdateBus, nodeProxy raftcluster.ProxyConfig, apiBaseURL string, httpTimeout time.Duration, logger *slog.Logger) *MessagingServer {
+func NewMessagingServer(node *raftcluster.Node, nodeProxy raftcluster.ProxyConfig, apiBaseURL string, httpTimeout time.Duration, logger *slog.Logger) *MessagingServer {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &MessagingServer{
 		node:        node,
-		bus:         bus,
 		nodeProxy:   nodeProxy,
 		apiBaseURL:  apiBaseURL,
 		httpTimeout: httpTimeoutOrDefault(httpTimeout),
@@ -306,8 +303,6 @@ func (s *MessagingServer) ListMessages(_ context.Context, req *botmanagerpb.List
 }
 
 // Subscribe (server-streaming) lives in messaging_subscribe.go — kept
-// separate to stay under the project's ~400-line-per-file guideline:
-// it merges telegram.UpdateBus with
-// raftcluster.Node.SubscribeEvents into one stream, plus its own small
-// conversion/filtering helpers, and reads naturally as one self-contained
-// unit apart from the request/response RPCs above.
+// separate to stay under the project's ~400-line-per-file guideline: it
+// streams the replicated journal plus its own small conversion/filtering
+// helpers, and reads naturally as one self-contained unit apart from the request/response RPCs above.

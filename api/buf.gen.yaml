@@ -1,0 +1,13 @@
+# Кодогенерация: `make proto` из корня репозитория (или `buf generate proto`
+# из этого каталога). Плагины ищутся в PATH:
+#   go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.12
+#   go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
+#   go install github.com/bufbuild/buf/cmd/buf@latest
+version: v2
+plugins:
+  - local: protoc-gen-go
+    out: botmanagerpb
+    opt: paths=source_relative
+  - local: protoc-gen-go-grpc
+    out: botmanagerpb
+    opt: paths=source_relative

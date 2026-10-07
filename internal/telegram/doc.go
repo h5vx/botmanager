@@ -23,11 +23,8 @@
 //     comment for the exact HTTP-status/description rules and
 //     failure_test.go for the table of real Telegram response shapes it is
 //     tested against.
-//   - bus.go — Update/UpdateBus/InMemoryBus: the in-process fan-out this
-//     package publishes incoming updates to. gRPC Messaging.Subscribe
-//     attaches to it — see "Extension point" below.
 //   - cluster.go — ClusterView, the narrow slice of *raftcluster.Node this
-//     package needs (Apply/ListMessages/SubscribeApplied), mirroring
+//     package needs (Apply/ListMessages/SubscribeApplied/PollOffset), mirroring
 //     botlifecycle.ClusterView's pattern so Runner is testable without a
 //     real Raft node.
 //   - runner.go, pollloop.go, sendloop.go, backoff.go — Runner, the
@@ -82,16 +79,16 @@
 // internal/raftcluster). Сознательное упрощение — см. CLAUDE.md,
 // "Что сознательно пусто".
 //
-// # Extension point: UpdateBus → Messaging.Subscribe
+// # Incoming updates: committed before acknowledged
 //
-// pollLoop publishes every converted update (incoming_message,
-// callback_query, chat_member_changed — the Update kinds that
-// originate from Telegram itself, as opposed to message_status_changed and
-// bot_state_changed, which originate from raftcluster's own
-// UpdateDelivery/SetBotState commands and are therefore not this package's
-// job to produce) to r.bus, an UpdateBus. NewRunnerFactory takes an
-// UpdateBus so callers (cmd/botmanager/main.go) can share one
-// InMemoryBus across every bot's Runner and attach the Messaging.Subscribe
-// gRPC stream as one more Subscribe() consumer — no changes to this
-// package required.
+// pollLoop records every batch of received updates (incoming_message,
+// callback_query, chat_member_changed) through Raft as one
+// CommandRecordUpdates, together with the getUpdates offset that
+// acknowledges them, and only then moves its offset forward — Telegram
+// treats an update as acknowledged only when a later getUpdates call
+// passes a higher offset. A failed commit therefore leaves the updates
+// with Telegram, and a new leader starts polling from the replicated
+// offset; duplicates are dropped by the FSM. The updates end up in the
+// replicated journal that Messaging.Subscribe streams (see
+// internal/raftcluster/journal.go).
 package telegram

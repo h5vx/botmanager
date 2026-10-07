@@ -14,7 +14,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	botmanagerpb "github.com/h5vx/botmanager/proto/gen"
+	"github.com/h5vx/botmanager/api/botmanagerpb"
 )
 
 // signInitDataForTest independently signs a minimal initData fixture per

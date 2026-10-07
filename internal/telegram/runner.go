@@ -27,7 +27,6 @@ var tokenPattern = regexp.MustCompile(`^\d+:[A-Za-z0-9_-]{10,}$`)
 // by Stop()/ctx cancellation.
 type Runner struct {
 	cluster   ClusterView
-	bus       UpdateBus
 	cfg       Config
 	nodeProxy raftcluster.ProxyConfig
 	logger    *slog.Logger
@@ -39,17 +38,16 @@ type Runner struct {
 }
 
 // NewRunnerFactory returns a botlifecycle.RunnerFactory that builds fresh
-// Runner instances sharing cluster/bus/cfg/nodeProxy/logger — Manager calls
-// it once per bot each time that bot starts (see botlifecycle.RunnerFactory
-// doc). cluster and bus are typically shared across every bot on this node;
-// nodeProxy is this node's proxy.* config (config.yaml), the default half
-// of the per-bot proxy override.
-func NewRunnerFactory(cluster ClusterView, bus UpdateBus, cfg Config, nodeProxy raftcluster.ProxyConfig, logger *slog.Logger) botlifecycle.RunnerFactory {
+// Runner instances sharing cluster/cfg/nodeProxy/logger — Manager calls it
+// once per bot each time that bot starts (see botlifecycle.RunnerFactory
+// doc). nodeProxy is this node's proxy.* config (config.yaml), the default
+// half of the per-bot proxy override.
+func NewRunnerFactory(cluster ClusterView, cfg Config, nodeProxy raftcluster.ProxyConfig, logger *slog.Logger) botlifecycle.RunnerFactory {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return func() botlifecycle.BotRunner {
-		return &Runner{cluster: cluster, bus: bus, cfg: cfg, nodeProxy: nodeProxy, logger: logger}
+		return &Runner{cluster: cluster, cfg: cfg, nodeProxy: nodeProxy, logger: logger}
 	}
 }
 

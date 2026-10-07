@@ -2,19 +2,23 @@ package config
 
 import (
 	"os"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/h5vx/botmanager/internal/raftcluster"
 )
 
 func TestLoadMissingFileUsesDefaults(t *testing.T) {
+	t.Setenv("BOTMANAGER_SECURITY__INSECURE", "true")
 	cfg, err := Load("does/not/exist.yaml")
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 
 	want := Default()
-	if cfg != want {
+	want.Security.Insecure = true
+	if !reflect.DeepEqual(cfg, want) {
 		t.Fatalf("cfg = %+v, want defaults %+v", cfg, want)
 	}
 }
@@ -22,7 +26,7 @@ func TestLoadMissingFileUsesDefaults(t *testing.T) {
 func TestLoadFile(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/config.yaml"
-	yaml := "grpc:\n  listen_addr: \":19090\"\nobservability:\n  log_level: DEBUG\n" +
+	yaml := "security:\n  insecure: true\ngrpc:\n  listen_addr: \":19090\"\nobservability:\n  log_level: DEBUG\n" +
 		"raft:\n  message_retention_per_bot: 42\n  bootstrap: false\n"
 	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -94,5 +98,64 @@ func TestEnvOverride(t *testing.T) {
 	}
 	if cfg.Raft.Bootstrap {
 		t.Errorf("Raft.Bootstrap = true, want false")
+	}
+}
+
+func TestLoad_RequiresSecurityUnlessInsecure(t *testing.T) {
+	_, err := Load("does/not/exist.yaml")
+	if err == nil || !strings.Contains(err.Error(), "security.ca_file") || !strings.Contains(err.Error(), "security.token_key_file") {
+		t.Fatalf("err = %v, want missing security settings", err)
+	}
+
+	for k, v := range map[string]string{
+		"BOTMANAGER_SECURITY__CA_FILE": "ca.pem", "BOTMANAGER_SECURITY__CERT_FILE": "node.pem",
+		"BOTMANAGER_SECURITY__KEY_FILE": "node-key.pem", "BOTMANAGER_SECURITY__TOKEN_KEY_FILE": "token.key",
+	} {
+		t.Setenv(k, v)
+	}
+	if _, err := Load("does/not/exist.yaml"); err != nil {
+		t.Fatalf("Load with security settings: %v", err)
+	}
+}
+
+func TestPeers_FromYAMLAndEnv(t *testing.T) {
+	t.Setenv("BOTMANAGER_SECURITY__INSECURE", "true")
+	path := t.TempDir() + "/c.yaml"
+	yaml := "raft:\n  peers:\n    - id: n2\n      raft_addr: 10.0.0.2:9092\n      grpc_addr: 10.0.0.2:9090\n"
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Raft.Peers) != 1 || cfg.Raft.Peers[0] != (PeerConfig{ID: "n2", RaftAddr: "10.0.0.2:9092", GRPCAddr: "10.0.0.2:9090"}) {
+		t.Fatalf("yaml peers = %+v", cfg.Raft.Peers)
+	}
+
+	t.Setenv("BOTMANAGER_RAFT__PEERS", "n2/10.0.0.2:9092/10.0.0.2:9090, n3/10.0.0.3:9092/10.0.0.3:9090")
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Raft.Peers) != 2 || cfg.Raft.Peers[1].ID != "n3" || cfg.Raft.Peers[1].GRPCAddr != "10.0.0.3:9090" {
+		t.Fatalf("env peers = %+v", cfg.Raft.Peers)
+	}
+
+	t.Setenv("BOTMANAGER_RAFT__PEERS", "broken")
+	if _, err := Load(path); err == nil {
+		t.Fatalf("malformed peers accepted")
+	}
+}
+
+func TestGRPCAdvertiseAddr(t *testing.T) {
+	cfg := Default()
+	cfg.Node.RaftAdvertise = "10.0.0.5:9092"
+	if got, err := cfg.GRPCAdvertiseAddr(); err != nil || got != "10.0.0.5:9090" {
+		t.Fatalf("derived = %q, %v", got, err)
+	}
+	cfg.Node.GRPCAdvertise = "bm-1.internal:9090"
+	if got, _ := cfg.GRPCAdvertiseAddr(); got != "bm-1.internal:9090" {
+		t.Fatalf("explicit = %q", got)
 	}
 }

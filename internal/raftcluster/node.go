@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -41,19 +41,39 @@ type Config struct {
 	// DataDir holds the BoltDB log/stable store and file snapshots when
 	// Deps does not override them (config `node.data_dir`).
 	DataDir string
-	// BindAddr is the TCP address this node's Raft transport listens and
-	// is advertised on (config `node.raft_bind_addr`). Unused when
-	// Deps.Transport is set.
+	// BindAddr is the TCP address this node's Raft transport listens on
+	// (config `node.raft_bind_addr`). Unused when Deps.Transport is set.
 	BindAddr string
+	// AdvertiseAddr is the address other nodes dial to reach this node's
+	// Raft transport (config `node.raft_advertise_addr`); empty = BindAddr.
+	AdvertiseAddr string
+	// TLS, when set, runs the Raft transport over mutual TLS. Nil means
+	// plain TCP (development only).
+	TLS *TransportTLS
+	// TokenCipher, when set, encrypts bot tokens before they enter the Raft
+	// log (see TokenCipher). Nil stores tokens in plaintext (development
+	// only).
+	TokenCipher *TokenCipher
+	// Self is this node's registry entry (its gRPC address in particular).
+	// Whenever this node becomes leader it makes sure Self and KnownPeers
+	// are present in the replicated node registry.
+	Self NodeInfo
+	// KnownPeers are the other cluster members from static configuration
+	// (config `raft.peers`), used to seed the node registry and, together
+	// with Bootstrap, the initial Raft configuration.
+	KnownPeers []NodeInfo
+	// JournalRetention overrides DefaultJournalRetention; <= 0 = default.
+	JournalRetention int
+	// Logger receives background-task warnings; nil = slog.Default().
+	Logger *slog.Logger
 	// Bootstrap, when true, initializes a brand-new cluster on first start
 	// (raft.BootstrapCluster) — but only if this node has no existing Raft
 	// state yet, so it is safe to leave true across restarts.
 	Bootstrap bool
 	// BootstrapPeers is the initial cluster configuration used when
-	// Bootstrap is true. Empty means "single-node cluster containing only
-	// this node" — the default (see Dependencies doc above). A
-	// multi-node deployment passes the full server list here, identically
-	// on every node being bootstrapped together.
+	// Bootstrap is true. Empty means "this node plus KnownPeers" — a single
+	// node when KnownPeers is empty too. Every node bootstrapped together
+	// must end up with the same server list.
 	BootstrapPeers []raft.Server
 	// MessageRetentionPerBot overrides DefaultMessageRetentionPerBot; <= 0
 	// means "use the default".
@@ -69,21 +89,26 @@ type Config struct {
 
 // Node wraps one Raft server together with its FSM and exposes this
 // package's public surface: apply commands, check/observe leadership, and
-// read the replicated state. It is deliberately shaped so that the next
-// step can implement BotAdmin/Messaging/Maintenance as thin gRPC adapters
-// over these methods without reaching into raft.Raft directly.
+// read the replicated state. internal/rpcserver implements
+// BotAdmin/Messaging/Maintenance as thin gRPC adapters over these methods
+// without reaching into raft.Raft directly.
 type Node struct {
-	id   string
-	raft *raft.Raft
-	fsm  *FSM
+	id         string
+	raft       *raft.Raft
+	fsm        *FSM
+	cipher     *TokenCipher
+	self       NodeInfo
+	knownPeers []NodeInfo
+	logger     *slog.Logger
 
 	leaderMu     sync.Mutex
 	leaderChs    map[chan bool]struct{}
 	stopLeaderFw chan struct{}
 }
 
-// Open builds and starts (or rejoins, once membership RPCs exist) one Raft
-// node.
+// Open builds and starts (or restarts) one Raft node. A node that is
+// neither bootstrapped nor has existing state waits to be added to a
+// running cluster (Node.AddVoter on the current leader).
 func Open(cfg Config) (*Node, error) {
 	if cfg.NodeID == "" {
 		return nil, fmt.Errorf("raftcluster: NodeID is required")
@@ -94,6 +119,7 @@ func Open(cfg Config) (*Node, error) {
 		retention = DefaultMessageRetentionPerBot
 	}
 	fsm := NewFSM(retention)
+	fsm.SetJournalRetention(cfg.JournalRetention)
 
 	raftCfg := cfg.RaftConfig
 	if raftCfg == nil {
@@ -120,39 +146,47 @@ func Open(cfg Config) (*Node, error) {
 	}
 
 	if cfg.Bootstrap {
-		if err := bootstrapIfNew(r, logStore, stableStore, snapStore, raftCfg.LocalID, transport, cfg.BootstrapPeers); err != nil {
+		peers := cfg.BootstrapPeers
+		if len(peers) == 0 && len(cfg.KnownPeers) > 0 {
+			peers = []raft.Server{{ID: raftCfg.LocalID, Address: transport.LocalAddr()}}
+			for _, p := range cfg.KnownPeers {
+				if p.ID == cfg.NodeID {
+					continue
+				}
+				peers = append(peers, raft.Server{ID: raft.ServerID(p.ID), Address: raft.ServerAddress(p.RaftAddr)})
+			}
+		}
+		if err := bootstrapIfNew(r, logStore, stableStore, snapStore, raftCfg.LocalID, transport, peers); err != nil {
 			return nil, err
 		}
+	}
+
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	self := cfg.Self
+	self.ID = cfg.NodeID
+	if self.RaftAddr == "" {
+		self.RaftAddr = string(transport.LocalAddr())
 	}
 
 	n := &Node{
 		id:           cfg.NodeID,
 		raft:         r,
 		fsm:          fsm,
+		cipher:       cfg.TokenCipher,
+		self:         self,
+		knownPeers:   cfg.KnownPeers,
+		logger:       logger,
 		leaderChs:    make(map[chan bool]struct{}),
 		stopLeaderFw: make(chan struct{}),
 	}
+	leaderCh, _ := n.Subscribe()
 	go n.forwardLeadership()
+	go n.registerOnLeadership(leaderCh)
 
 	return n, nil
-}
-
-func buildTransport(cfg Config) (raft.Transport, error) {
-	if cfg.Deps.Transport != nil {
-		return cfg.Deps.Transport, nil
-	}
-	if cfg.BindAddr == "" {
-		return nil, fmt.Errorf("raftcluster: BindAddr is required when Deps.Transport is not set")
-	}
-	addr, err := net.ResolveTCPAddr("tcp", cfg.BindAddr)
-	if err != nil {
-		return nil, fmt.Errorf("raftcluster: resolve bind addr %q: %w", cfg.BindAddr, err)
-	}
-	t, err := raft.NewTCPTransport(cfg.BindAddr, addr, 3, 10*time.Second, io.Discard)
-	if err != nil {
-		return nil, fmt.Errorf("raftcluster: tcp transport: %w", err)
-	}
-	return t, nil
 }
 
 func buildLogStores(cfg Config) (raft.LogStore, raft.StableStore, error) {
@@ -284,13 +318,29 @@ func (n *Node) SubscribeApplied() (<-chan struct{}, func()) {
 	return n.fsm.SubscribeApplied()
 }
 
-// SubscribeEvents returns a channel receiving one FSM Event per
-// successfully applied command (bot/message-specific detail, unlike
-// SubscribeApplied's coarse signal) — see FSM.Event doc. Used by the gRPC
-// layer's Messaging.Subscribe to produce targeted message_status_changed
-// and bot_state_changed updates.
-func (n *Node) SubscribeEvents() (<-chan Event, func()) {
-	return n.fsm.SubscribeEvents()
+// ReadJournal returns up to limit journal entries with Seq > after — see
+// FSM.ReadJournal. Works on any node: the journal is replicated.
+func (n *Node) ReadJournal(after uint64, limit int) ([]JournalEntry, uint64, uint64) {
+	return n.fsm.ReadJournal(after, limit)
+}
+
+// PollOffset returns the getUpdates offset recorded for botID.
+func (n *Node) PollOffset(botID string) int64 { return n.fsm.PollOffset(botID) }
+
+// ListNodes returns the replicated node registry, ordered by ID.
+func (n *Node) ListNodes() []NodeInfo { return n.fsm.ListNodes() }
+
+// GetNode returns one node registry entry.
+func (n *Node) GetNode(id string) (NodeInfo, bool) { return n.fsm.GetNode(id) }
+
+// LeaderInfo returns the registry entry of the current leader, if both the
+// leader and its registry entry are known.
+func (n *Node) LeaderInfo() (NodeInfo, bool) {
+	id := n.LeaderID()
+	if id == "" {
+		return NodeInfo{}, false
+	}
+	return n.fsm.GetNode(id)
 }
 
 // IsLeader reports whether this node is currently the Raft leader.
@@ -306,11 +356,7 @@ func (n *Node) LeaderAddr() string {
 }
 
 // LeaderID returns the Raft server ID of the current leader as this node
-// currently understands it (empty if unknown/no leader elected). Used by
-// Maintenance.GetClusterStatus and by the gRPC layer's
-// not-leader error (a deliberate simplification — see
-// CLAUDE.md — instead of retransmitting a write to the leader,
-// the gRPC layer returns an error naming it).
+// currently understands it (empty if unknown/no leader elected).
 func (n *Node) LeaderID() string {
 	_, id := n.raft.LeaderWithID()
 	return string(id)
@@ -343,6 +389,10 @@ func (n *Node) Apply(cmd Command, timeout time.Duration) (*ApplyResult, error) {
 		return nil, ErrNotLeader
 	}
 
+	cmd, err := n.encryptTokens(cmd)
+	if err != nil {
+		return nil, err
+	}
 	data, err := json.Marshal(cmd)
 	if err != nil {
 		return nil, fmt.Errorf("raftcluster: encode command: %w", err)
@@ -360,16 +410,78 @@ func (n *Node) Apply(cmd Command, timeout time.Duration) (*ApplyResult, error) {
 	if result.Err != nil {
 		return nil, result.Err
 	}
+	if result.Bot != nil {
+		b := n.decryptBot(*result.Bot)
+		result.Bot = &b
+	}
 	return result, nil
 }
 
-// ListBots returns every bot currently known to this node's (replicated)
-// state, ordered by ID. Safe to call on any node, leader or follower —
-// reads never go through Raft.
-func (n *Node) ListBots() []Bot { return n.fsm.ListBots() }
+// encryptTokens returns cmd with bot tokens encrypted by n.cipher (if any).
+// The command's payload structs are copied, never mutated in place — they
+// belong to the caller.
+func (n *Node) encryptTokens(cmd Command) (Command, error) {
+	if n.cipher == nil {
+		return cmd, nil
+	}
+	switch {
+	case cmd.CreateBot != nil:
+		c := *cmd.CreateBot
+		enc, err := n.cipher.Encrypt(c.Token)
+		if err != nil {
+			return cmd, err
+		}
+		c.Token = enc
+		cmd.CreateBot = &c
+	case cmd.UpdateBot != nil && cmd.UpdateBot.Token != nil:
+		c := *cmd.UpdateBot
+		enc, err := n.cipher.Encrypt(*c.Token)
+		if err != nil {
+			return cmd, err
+		}
+		c.Token = &enc
+		cmd.UpdateBot = &c
+	}
+	return cmd, nil
+}
 
-// GetBot returns one bot and whether it exists.
-func (n *Node) GetBot(id string) (Bot, bool) { return n.fsm.GetBot(id) }
+// decryptBot returns b with its token decrypted. A token that cannot be
+// decrypted (wrong key) is cleared and logged: the bot then fails to start
+// with an obviously malformed token instead of sending ciphertext to
+// Telegram.
+func (n *Node) decryptBot(b Bot) Bot {
+	if n.cipher == nil {
+		return b
+	}
+	plain, err := n.cipher.Decrypt(b.Token)
+	if err != nil {
+		n.logger.Error("bot token cannot be decrypted",
+			"event", "raftcluster.token_decrypt_failed", "bot_id", b.ID, "error", err.Error())
+		plain = ""
+	}
+	b.Token = plain
+	return b
+}
+
+// ListBots returns every bot currently known to this node's (replicated)
+// state, ordered by ID, with tokens decrypted. Safe to call on any node,
+// leader or follower — reads never go through Raft.
+func (n *Node) ListBots() []Bot {
+	bots := n.fsm.ListBots()
+	for i := range bots {
+		bots[i] = n.decryptBot(bots[i])
+	}
+	return bots
+}
+
+// GetBot returns one bot (token decrypted) and whether it exists.
+func (n *Node) GetBot(id string) (Bot, bool) {
+	b, ok := n.fsm.GetBot(id)
+	if !ok {
+		return Bot{}, false
+	}
+	return n.decryptBot(b), true
+}
 
 // GetMessage looks up one message by idempotency key.
 func (n *Node) GetMessage(idempotencyKey string) (Message, bool) {
@@ -399,17 +511,80 @@ func (n *Node) ListChatRegistry(botID string) []ChatMembership {
 // TransferLeadershipTo asks Raft to hand leadership to the server identified
 // by id/address, using Raft's own leadership-transfer mechanism
 // (raft.Raft.LeadershipTransferToServer) rather than stepping down and
-// letting a new election pick whoever wins (администратор должен уметь вывести конкретный узел на обслуживание предсказуемо, не
-// самодельными выборами). Blocks until the transfer completes or fails;
-// ErrNotLeader if this node is not currently the leader (mirrors Apply's own
-// check — the caller, not this package, retransmits to the real leader, see
-// requireLeader in internal/rpcserver).
+// letting a new election pick whoever wins (администратор должен уметь
+// вывести конкретный узел на обслуживание предсказуемо, не самодельными
+// выборами). Blocks until the transfer completes or fails; ErrNotLeader if
+// this node is not currently the leader.
 func (n *Node) TransferLeadershipTo(id, address string) error {
 	if !n.IsLeader() {
 		return ErrNotLeader
 	}
 	future := n.raft.LeadershipTransferToServer(raft.ServerID(id), raft.ServerAddress(address))
 	return future.Error()
+}
+
+// AddVoter adds a node to the cluster as a voting member and records its
+// addresses in the node registry. The node must already be running (not
+// bootstrapped) and reachable at info.RaftAddr. Leader only.
+func (n *Node) AddVoter(info NodeInfo, timeout time.Duration) error {
+	if !n.IsLeader() {
+		return ErrNotLeader
+	}
+	if info.ID == "" || info.RaftAddr == "" {
+		return fmt.Errorf("%w: add_voter: id and raft address are required", ErrInvalidCommand)
+	}
+	if _, err := n.Apply(Command{Type: CommandRegisterNode, RegisterNode: &RegisterNodeCommand{Node: info}}, timeout); err != nil {
+		return err
+	}
+	return n.raft.AddVoter(raft.ServerID(info.ID), raft.ServerAddress(info.RaftAddr), 0, timeout).Error()
+}
+
+// RemoveServer removes a node from the cluster and from the node
+// registry. Removing the leader itself is allowed: Raft steps it down.
+// Leader only.
+func (n *Node) RemoveServer(id string, timeout time.Duration) error {
+	if !n.IsLeader() {
+		return ErrNotLeader
+	}
+	if _, err := n.Apply(Command{Type: CommandUnregisterNode, UnregisterNode: &UnregisterNodeCommand{ID: id}}, timeout); err != nil {
+		return err
+	}
+	return n.raft.RemoveServer(raft.ServerID(id), 0, timeout).Error()
+}
+
+// registerOnLeadership makes sure this node and its statically configured
+// peers are present in the node registry every time this node becomes
+// leader. Followers cannot write, so the leader registers everyone it
+// knows about; a node added later via AddVoter is registered there.
+func (n *Node) registerOnLeadership(leaderCh <-chan bool) {
+	for {
+		select {
+		case isLeader := <-leaderCh:
+			if !isLeader {
+				continue
+			}
+			want := append([]NodeInfo{n.self}, n.knownPeers...)
+			for _, info := range want {
+				if info.ID == "" {
+					continue
+				}
+				cur, ok := n.fsm.GetNode(info.ID)
+				if ok && info.GRPCAddr == "" {
+					info.GRPCAddr = cur.GRPCAddr // не затираем известный адрес пустым
+				}
+				if ok && cur == info {
+					continue
+				}
+				cmd := Command{Type: CommandRegisterNode, RegisterNode: &RegisterNodeCommand{Node: info}}
+				if _, err := n.Apply(cmd, 5*time.Second); err != nil {
+					n.logger.Warn("node registration failed",
+						"event", "raftcluster.register_node_failed", "node_id", info.ID, "error", err.Error())
+				}
+			}
+		case <-n.stopLeaderFw:
+			return
+		}
+	}
 }
 
 // Shutdown stops the Raft node and the leadership-forwarding goroutine. It

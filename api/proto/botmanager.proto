@@ -9,7 +9,7 @@ syntax = "proto3";
 
 package botmanager.v1;
 
-option go_package = "github.com/h5vx/botmanager/proto/gen;botmanagerpb";
+option go_package = "github.com/h5vx/botmanager/api/botmanagerpb;botmanagerpb";
 
 import "google/protobuf/timestamp.proto";
 
@@ -351,7 +351,12 @@ message ListMessagesRequest {
 }
 
 message SubscribeRequest {
-  repeated string bot_ids = 1; // пусто = все боты узла
+  repeated string bot_ids = 1; // пусто = все боты
+  // Возобновление потока. Не задано — только новые события, начиная с
+  // момента подписки. Задано — сначала все сохранённые события с
+  // sequence > after_sequence, затем новые. Если часть запрошенной истории
+  // уже вытеснена retention журнала, поток завершается с OUT_OF_RANGE.
+  optional uint64 after_sequence = 2;
 }
 
 // Виды обновления в потоке Subscribe (не только входящие сообщения).
@@ -393,6 +398,10 @@ message BotStateChanged {
 
 message Update {
   google.protobuf.Timestamp occurred_at = 1;
+  // Номер события в реплицированном журнале: строго возрастает и одинаков
+  // на всех узлах кластера. Используется для возобновления Subscribe
+  // (SubscribeRequest.after_sequence) и дедупликации на стороне клиента.
+  uint64 sequence = 7;
   oneof payload {
     IncomingMessage incoming_message = 2;
     CallbackQuery callback_query = 3;
@@ -427,6 +436,8 @@ message NodeStatus {
   bool is_leader = 2;
   bool reachable = 3;
   bool proxy_healthy = 4; // здоровье прокси проверяется отдельно от Telegram
+  string raft_address = 5;
+  string grpc_address = 6; // пусто, если узел ещё не зарегистрировал свой gRPC-адрес
 }
 
 message ClusterStatus {
@@ -436,6 +447,19 @@ message ClusterStatus {
 }
 
 message ExportStateRequest {}
+
+// AddNodeRequest — добавить узел в кластер голосующим членом. Узел должен
+// быть уже запущен (без bootstrap) и доступен по raft_address.
+message AddNodeRequest {
+  string node_id = 1;
+  string raft_address = 2;
+  string grpc_address = 3;
+}
+
+// RemoveNodeRequest — вывести узел из кластера.
+message RemoveNodeRequest {
+  string node_id = 1;
+}
 
 message Chunk {
   bytes data = 1;
@@ -472,12 +496,15 @@ service Maintenance {
   // TransferLeadership назначает мастером конкретный узел
   // поверх штатной передачи лидерства Raft (RaftCluster.LeadershipTransferToServer),
   // не самодельных выборов. NOT_FOUND — узел неизвестен кластеру,
-  // FAILED_PRECONDITION — вызов пришёл не на лидера (с указанием текущего
-  // лидера), UNAVAILABLE — передача не удалась.
+  // UNAVAILABLE — передача не удалась.
   rpc TransferLeadership(TransferLeadershipRequest) returns (ClusterStatus);
   // PingTelegram проверяет доступность Telegram API со стороны botmanager,
   // в том числе через настроенный прокси — отвечает на
   // вопрос "это у нас сеть или у Telegram". Таймаут —
   // CLAUDE.md, раздел "PingTelegram".
   rpc PingTelegram(PingTelegramRequest) returns (PingResult);
+  // AddNode/RemoveNode меняют состав Raft-кластера. Как и любая запись,
+  // выполняются на лидере (вызов на другом узле пересылается лидеру).
+  rpc AddNode(AddNodeRequest) returns (ClusterStatus);
+  rpc RemoveNode(RemoveNodeRequest) returns (ClusterStatus);
 }

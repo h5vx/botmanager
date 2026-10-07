@@ -7,14 +7,17 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
 
+	"github.com/h5vx/botmanager/api/botmanagerpb"
 	"github.com/h5vx/botmanager/internal/raftcluster"
 	"github.com/h5vx/botmanager/internal/telegram"
-	botmanagerpb "github.com/h5vx/botmanager/proto/gen"
 )
 
 // exportChunkSize bounds how much of Node.ExportSnapshot's JSON output
@@ -38,7 +41,21 @@ type MaintenanceServer struct {
 	apiBaseURL  string
 	httpTimeout time.Duration
 	logger      *slog.Logger
+	peers       PeerDialer
 }
+
+// PeerDialer gives MaintenanceServer connections to other nodes' gRPC
+// endpoints for health probes; *Forwarder implements it.
+type PeerDialer interface {
+	Conn(addr string) (*grpc.ClientConn, error)
+}
+
+// peerProbeTimeout bounds one health probe of a peer in GetClusterStatus.
+const peerProbeTimeout = time.Second
+
+// SetPeerDialer enables real reachability probes of other nodes in
+// GetClusterStatus. Without it, only this node is reported reachable.
+func (s *MaintenanceServer) SetPeerDialer(d PeerDialer) { s.peers = d }
 
 // NewMaintenanceServer constructs a MaintenanceServer. nodeProxy/apiBaseURL/
 // httpTimeout/logger — тот же смысл и то же умолчание (logger == nil →
@@ -56,23 +73,21 @@ func NewMaintenanceServer(node *raftcluster.Node, nodeProxy raftcluster.ProxyCon
 	}
 }
 
-// GetClusterStatus reports every node in the current Raft configuration,
-// which node is leader, and every bot's replicated state.
+// GetClusterStatus reports every node in the current Raft configuration
+// with its addresses (from the node registry), which node is leader, and
+// every bot's replicated state.
 //
-// reachable/proxy_healthy simplification (single-node — see
-// CLAUDE.md): this node reports itself reachable (it is
-// answering the RPC) and, since it has no peers to probe, every other
-// listed node (there are none on a single-node cluster) would need a real
-// network check this deployment cannot perform yet — there is no peer gRPC
-// address list, and this environment has no way to run more than one node
-// to test it against (the same constraint documented for
-// internal/raftcluster's single-node bootstrap and
-// internal/telegram's "node problem ⇒ step down" gap). proxy_healthy is
-// left false (BotAdmin/Messaging's own live Telegram calls already surface
-// proxy failures per-call via telegramError; a standalone proxy health
-// probe is not implemented). This is a deliberate simplification, not a
-// guess dressed up as a check.
-func (s *MaintenanceServer) GetClusterStatus(_ context.Context, _ *botmanagerpb.Empty) (*botmanagerpb.ClusterStatus, error) {
+// reachable: this node is reachable by definition (it is answering); every
+// other node is probed with a grpc.health.v1 Check on its registered gRPC
+// address, in parallel, each bounded by peerProbeTimeout. A node without a
+// registered gRPC address, or with no PeerDialer configured, is reported
+// unreachable. proxy_healthy is not probed here — use PingTelegram on the
+// node in question.
+func (s *MaintenanceServer) GetClusterStatus(ctx context.Context, _ *botmanagerpb.Empty) (*botmanagerpb.ClusterStatus, error) {
+	return s.clusterStatus(ctx)
+}
+
+func (s *MaintenanceServer) clusterStatus(ctx context.Context) (*botmanagerpb.ClusterStatus, error) {
 	servers, err := s.node.Configuration()
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "read raft configuration: %v", err)
@@ -80,16 +95,29 @@ func (s *MaintenanceServer) GetClusterStatus(_ context.Context, _ *botmanagerpb.
 	leaderID := s.node.LeaderID()
 	thisID := s.node.ID()
 
-	nodes := make([]*botmanagerpb.NodeStatus, 0, len(servers))
-	for _, srv := range servers {
+	nodes := make([]*botmanagerpb.NodeStatus, len(servers))
+	var wg sync.WaitGroup
+	for i, srv := range servers {
 		id := string(srv.ID)
-		nodes = append(nodes, &botmanagerpb.NodeStatus{
-			NodeId:       id,
-			IsLeader:     id == leaderID,
-			Reachable:    id == thisID, // см. комментарий выше — соседей проверить нечем
-			ProxyHealthy: false,
-		})
+		ns := &botmanagerpb.NodeStatus{
+			NodeId:      id,
+			IsLeader:    id == leaderID,
+			Reachable:   id == thisID,
+			RaftAddress: string(srv.Address),
+		}
+		if info, ok := s.node.GetNode(id); ok {
+			ns.GrpcAddress = info.GRPCAddr
+		}
+		nodes[i] = ns
+		if id != thisID && ns.GrpcAddress != "" && s.peers != nil {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				ns.Reachable = s.probe(ctx, ns.GrpcAddress)
+			}()
+		}
 	}
+	wg.Wait()
 
 	bots := s.node.ListBots()
 	botsOut := make([]*botmanagerpb.Bot, 0, len(bots))
@@ -103,6 +131,73 @@ func (s *MaintenanceServer) GetClusterStatus(_ context.Context, _ *botmanagerpb.
 		Bots:     botsOut,
 	}, nil
 }
+
+func (s *MaintenanceServer) probe(ctx context.Context, addr string) bool {
+	conn, err := s.peers.Conn(addr)
+	if err != nil {
+		return false
+	}
+	pctx, cancel := context.WithTimeout(ctx, peerProbeTimeout)
+	defer cancel()
+	resp, err := healthpb.NewHealthClient(conn).Check(pctx, &healthpb.HealthCheckRequest{})
+	return err == nil && resp.GetStatus() == healthpb.HealthCheckResponse_SERVING
+}
+
+// AddNode adds a running, not-yet-bootstrapped node to the cluster as a
+// voter and records its addresses in the node registry. Leader only (a
+// follower forwards the call, see Forwarder).
+func (s *MaintenanceServer) AddNode(ctx context.Context, req *botmanagerpb.AddNodeRequest) (*botmanagerpb.ClusterStatus, error) {
+	if err := requireLeader(s.node); err != nil {
+		return nil, err
+	}
+	if req.GetNodeId() == "" || req.GetRaftAddress() == "" || req.GetGrpcAddress() == "" {
+		return nil, status.Error(codes.InvalidArgument, "node_id, raft_address and grpc_address are required")
+	}
+	info := raftcluster.NodeInfo{ID: req.GetNodeId(), RaftAddr: req.GetRaftAddress(), GRPCAddr: req.GetGrpcAddress()}
+	if err := s.node.AddVoter(info, membershipTimeout); err != nil {
+		if errors.Is(err, raftcluster.ErrNotLeader) || errors.Is(err, raftcluster.ErrInvalidCommand) {
+			return nil, applyError(err)
+		}
+		return nil, status.Errorf(codes.Unavailable, "add node %s: %v", info.ID, err)
+	}
+	s.logger.Info("node added", "event", "maintenance.node_added", "node_id", info.ID, "raft_addr", info.RaftAddr, "grpc_addr", info.GRPCAddr)
+	return s.clusterStatus(ctx)
+}
+
+// RemoveNode removes a node from the cluster and from the node registry.
+// Removing the current leader is allowed: Raft steps it down and the
+// remaining nodes elect a new one.
+func (s *MaintenanceServer) RemoveNode(ctx context.Context, req *botmanagerpb.RemoveNodeRequest) (*botmanagerpb.ClusterStatus, error) {
+	if err := requireLeader(s.node); err != nil {
+		return nil, err
+	}
+	id := req.GetNodeId()
+	servers, err := s.node.Configuration()
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read raft configuration: %v", err)
+	}
+	found := false
+	for _, srv := range servers {
+		if string(srv.ID) == id {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil, status.Errorf(codes.NotFound, "node %q is not part of the cluster", id)
+	}
+	if err := s.node.RemoveServer(id, membershipTimeout); err != nil {
+		if errors.Is(err, raftcluster.ErrNotLeader) {
+			return nil, applyError(err)
+		}
+		return nil, status.Errorf(codes.Unavailable, "remove node %s: %v", id, err)
+	}
+	s.logger.Info("node removed", "event", "maintenance.node_removed", "node_id", id)
+	return s.clusterStatus(ctx)
+}
+
+// membershipTimeout bounds one membership change (AddNode/RemoveNode).
+const membershipTimeout = 10 * time.Second
 
 // ExportState streams Node.ExportSnapshot's JSON-encoded state in
 // exportChunkSize-bounded pieces via an io.Pipe: ExportSnapshot writes into

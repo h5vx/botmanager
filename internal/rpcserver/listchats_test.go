@@ -9,8 +9,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/h5vx/botmanager/api/botmanagerpb"
 	"github.com/h5vx/botmanager/internal/raftcluster"
-	botmanagerpb "github.com/h5vx/botmanager/proto/gen"
 )
 
 // TestBotAdmin_ListChats covers distinct chats a bot has

@@ -13,9 +13,8 @@ import (
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/raft"
 
+	"github.com/h5vx/botmanager/api/botmanagerpb"
 	"github.com/h5vx/botmanager/internal/raftcluster"
-	"github.com/h5vx/botmanager/internal/telegram"
-	botmanagerpb "github.com/h5vx/botmanager/proto/gen"
 )
 
 // testRaftConfig shrinks election/heartbeat timeouts so a single-node
@@ -39,10 +38,16 @@ func testRaftConfig() *raft.Config {
 // instead of through raftcluster's own package-internal API.
 func newTestNode(t *testing.T) *raftcluster.Node {
 	t.Helper()
+	return newTestNodeWith(t, nil)
+}
+
+// newTestNodeWith is newTestNode with a hook to adjust the configuration.
+func newTestNodeWith(t *testing.T, mutate func(*raftcluster.Config)) *raftcluster.Node {
+	t.Helper()
 	_, transport := raft.NewInmemTransport(raft.ServerAddress("test-node"))
 	store := raft.NewInmemStore() // serves as both LogStore and StableStore
 
-	node, err := raftcluster.Open(raftcluster.Config{
+	cfg := raftcluster.Config{
 		NodeID:                 "test-node",
 		DataDir:                t.TempDir(),
 		Bootstrap:              true,
@@ -54,7 +59,11 @@ func newTestNode(t *testing.T) *raftcluster.Node {
 			StableStore:   store,
 			SnapshotStore: raft.NewInmemSnapshotStore(),
 		},
-	})
+	}
+	if mutate != nil {
+		mutate(&cfg)
+	}
+	node, err := raftcluster.Open(cfg)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -92,9 +101,8 @@ func newTestClientsWithBaseURL(t *testing.T, node *raftcluster.Node, apiBaseURL 
 	lis := bufconn.Listen(bufSize)
 
 	server := grpc.NewServer()
-	bus := telegram.NewInMemoryBus()
 	botmanagerpb.RegisterBotAdminServer(server, NewBotAdminServer(node, raftcluster.ProxyConfig{}, apiBaseURL, 0, nil))
-	botmanagerpb.RegisterMessagingServer(server, NewMessagingServer(node, bus, raftcluster.ProxyConfig{}, apiBaseURL, 0, nil))
+	botmanagerpb.RegisterMessagingServer(server, NewMessagingServer(node, raftcluster.ProxyConfig{}, apiBaseURL, 0, nil))
 	botmanagerpb.RegisterMaintenanceServer(server, NewMaintenanceServer(node, raftcluster.ProxyConfig{}, apiBaseURL, 0, nil))
 
 	go func() {

@@ -25,16 +25,24 @@ const (
 
 	// CommandUpdateChatMembership records one my_chat_member event
 	// (chat_member_changed) into the replicated chat registry — see
-	// ChatMembership and FSM.applyUpdateChatMembership. Applied by
-	// internal/telegram's Runner right after publishing the same event to
-	// its UpdateBus, so the registry and the live Messaging.Subscribe
-	// stream both see it, from the same source event.
+	// ChatMembership and FSM.applyUpdateChatMembership. The poll loop now
+	// records membership through CommandRecordUpdates; this command stays
+	// for direct use and for log entries written by older versions.
 	CommandUpdateChatMembership CommandType = "update_chat_membership"
+
+	// CommandRecordUpdates records a batch of received Telegram updates and
+	// the acknowledging getUpdates offset — see RecordUpdatesCommand.
+	CommandRecordUpdates CommandType = "record_updates"
+
+	// CommandRegisterNode/CommandUnregisterNode maintain the node registry
+	// (gRPC addresses of cluster members) — see NodeInfo.
+	CommandRegisterNode   CommandType = "register_node"
+	CommandUnregisterNode CommandType = "unregister_node"
 )
 
 // Command is the unit of replication through the Raft log (команды на
-// отправку, статусы доставки, принятые сообщения). It is JSON-encoded into raft.Log.Data by Node.Apply
-// and decoded back by FSM.Apply. Exactly one payload field is non-nil,
+// отправку, статусы доставки, принятые сообщения). It is JSON-encoded into
+// raft.Log.Data by Node.Apply and decoded back by FSM.Apply. Exactly one payload field is non-nil,
 // selected by Type; any other combination is rejected as ErrInvalidCommand.
 //
 // Determinism:
@@ -59,6 +67,9 @@ type Command struct {
 	CancelPending  *CancelPendingCommand  `json:"cancel_pending,omitempty"`
 
 	UpdateChatMembership *UpdateChatMembershipCommand `json:"update_chat_membership,omitempty"`
+	RecordUpdates        *RecordUpdatesCommand        `json:"record_updates,omitempty"`
+	RegisterNode         *RegisterNodeCommand         `json:"register_node,omitempty"`
+	UnregisterNode       *UnregisterNodeCommand       `json:"unregister_node,omitempty"`
 }
 
 // CreateBotCommand corresponds to BotAdmin.CreateBot. ID is

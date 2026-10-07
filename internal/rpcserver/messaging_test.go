@@ -11,7 +11,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	botmanagerpb "github.com/h5vx/botmanager/proto/gen"
+	"github.com/h5vx/botmanager/api/botmanagerpb"
 )
 
 // newFakeTelegramServer emulates just enough of the real Telegram Bot API
@@ -133,14 +133,11 @@ func TestIntegration_AnswerCallback_UsesBotIDFromRequest(t *testing.T) {
 	}
 }
 
-// TestIntegration_Subscribe_MergesUpdateBusAndFsmEvents covers Subscribe's
-// central job (see doc.go / messaging.go): a subscriber sees both
-// telegram.UpdateBus updates (published here directly, standing in for
-// what internal/telegram.Runner's long polling would publish) and
-// raftcluster message_status_changed events (produced by a real Send
-// through the same node), filtered to the requested bot_id — an update for
-// a different bot must not arrive.
-func TestIntegration_Subscribe_MergesUpdateBusAndFsmEvents(t *testing.T) {
+// TestIntegration_Subscribe_FiltersByBot: a subscriber sees
+// message_status_changed events produced by a real Send through the same
+// node, filtered to the requested bot_id — an event for a different bot
+// must not arrive.
+func TestIntegration_Subscribe_FiltersByBot(t *testing.T) {
 	node := newTestNode(t)
 	botAdmin, messaging, _ := newTestClients(t, node)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
