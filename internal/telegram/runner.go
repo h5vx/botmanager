@@ -32,6 +32,7 @@ type Runner struct {
 	logger    *slog.Logger
 
 	mu       sync.Mutex
+	botID    string
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
 	failOnce sync.Once
@@ -73,6 +74,7 @@ func (r *Runner) Start(ctx context.Context, bot raftcluster.Bot) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	r.mu.Lock()
 	r.cancel = cancel
+	r.botID = bot.ID
 	r.mu.Unlock()
 
 	r.logger.Info("bot runner starting",
@@ -99,11 +101,15 @@ func (r *Runner) Start(ctx context.Context, bot raftcluster.Bot) error {
 func (r *Runner) Stop() {
 	r.mu.Lock()
 	cancel := r.cancel
+	botID := r.botID
 	r.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
 	r.wg.Wait()
+	if r.cfg.Health != nil && botID != "" {
+		r.cfg.Health.BotStopped(botID)
+	}
 }
 
 // reportBroken classifies a failure discovered by either loop and, exactly

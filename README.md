@@ -18,6 +18,10 @@ messages. All domain logic lives in the services that call it.
   delivery statuses and the event journal are replicated. Only the leader
   talks to Telegram; when it fails, another node takes over within seconds
   and continues exactly where it stopped.
+- **Leadership follows Telegram.** If the leader loses its connection to
+  Telegram (network, proxy) while another node still has one, leadership
+  moves to that node. A graceful shutdown hands leadership over instantly
+  instead of waiting for a timeout.
 - **Talk to any node.** Writes sent to a follower are forwarded to the
   leader transparently; reads and the event stream are served by every
   node.
@@ -156,6 +160,24 @@ BOTMANAGER_RAFT__PEERS=node-2/10.0.0.2:9092/10.0.0.2:9090,node-3/10.0.0.3:9092/1
 Start all nodes; they elect a leader on their own. To grow a running
 cluster, start the new node with `raft.bootstrap: false` and call
 `Maintenance.AddNode` on any node; `Maintenance.RemoveNode` takes one out.
+
+### When leadership changes
+
+- **The leader process dies or loses the other nodes** — Raft elects a
+  new leader after the heartbeat timeout (about 1–2 s with the defaults;
+  tune `raft.heartbeat_timeout_ms`, `election_timeout_ms` and
+  `leader_lease_timeout_ms`).
+- **The leader is stopped gracefully** (SIGTERM) — it hands leadership to
+  another node first, so writes continue almost without a pause.
+- **The leader cannot reach Telegram, but a peer can** — when at least
+  `failover.min_failing_bots` bots (and at least half of the running ones)
+  have had no answer from Telegram for `failover.failure_window_seconds`,
+  the leader asks its peers to check Telegram for those same bots (with
+  their tokens and proxies) and hands leadership to one that succeeds.
+  If nobody reaches Telegram — an outage on Telegram's side or a broken
+  proxy of one bot — leadership stays where it is.
+- **Manually** — `Maintenance.TransferLeadership`, e.g. before
+  maintenance of a node.
 
 Ports:
 
@@ -340,6 +362,7 @@ internal/config/         YAML + environment overrides
 internal/observability/  logging, health endpoints, metrics
 internal/raftcluster/    Raft cluster, FSM, event journal, snapshots, mTLS transport, token encryption
 internal/botlifecycle/   which bots should be running on this node
+internal/failover/       hands leadership to a node that reaches Telegram
 internal/telegram/       Bot API client, long polling, sending, proxy
 internal/rpcserver/      gRPC services, forwarding writes to the leader
 internal/security/       mTLS configuration, token key loading
@@ -355,10 +378,6 @@ Each package's doc comment describes its design decisions.
   was committed, the new leader sends it again.
 - **One trust level.** Every certificate signed by the CA has full access
   to the API; there are no per-client permissions.
-- **Raft timeouts are not configurable**; with the defaults a failover
-  takes one to three seconds.
-- **No automatic leadership handoff** when several bots fail on the same
-  node at once (a sign of a broken network on that node).
 - **`GetClusterStatus.proxy_healthy`** is not probed; use `PingTelegram`
   on the node in question.
 - **Custom metrics** (`botmanager_is_leader`, `botmanager_bots_running`)

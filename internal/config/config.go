@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -29,6 +30,7 @@ type Config struct {
 	HTTP          HTTPConfig          `yaml:"http"`
 	Proxy         ProxyConfig         `yaml:"proxy"`
 	Telegram      TelegramConfig      `yaml:"telegram"`
+	Failover      FailoverConfig      `yaml:"failover"`
 	Security      SecurityConfig      `yaml:"security"`
 	Observability ObservabilityConfig `yaml:"observability"`
 }
@@ -67,6 +69,49 @@ type RaftConfig struct {
 	// с bootstrap задают начальный состав кластера (одинаковый на всех
 	// узлах) и gRPC-адреса для пересылки записей лидеру.
 	Peers PeerList `yaml:"peers"`
+	// Таймауты Raft в миллисекундах; 0 — умолчания hashicorp/raft (1000,
+	// 1000, 500). Меньше — быстрее смена упавшего лидера, но выше риск
+	// ложных выборов в медленной сети. Должно выполняться
+	// leader_lease <= heartbeat <= election — одинаково на всех узлах.
+	HeartbeatTimeoutMS   int `yaml:"heartbeat_timeout_ms"`
+	ElectionTimeoutMS    int `yaml:"election_timeout_ms"`
+	LeaderLeaseTimeoutMS int `yaml:"leader_lease_timeout_ms"`
+}
+
+// Значения hashicorp/raft по умолчанию, для проверки и документации.
+const (
+	defaultHeartbeatTimeoutMS   = 1000
+	defaultElectionTimeoutMS    = 1000
+	defaultLeaderLeaseTimeoutMS = 500
+)
+
+// RaftTimeouts возвращает эффективные таймауты Raft (с умолчаниями).
+func (r RaftConfig) RaftTimeouts() (heartbeat, election, lease time.Duration) {
+	pick := func(v, def int) time.Duration {
+		if v <= 0 {
+			v = def
+		}
+		return time.Duration(v) * time.Millisecond
+	}
+	return pick(r.HeartbeatTimeoutMS, defaultHeartbeatTimeoutMS),
+		pick(r.ElectionTimeoutMS, defaultElectionTimeoutMS),
+		pick(r.LeaderLeaseTimeoutMS, defaultLeaderLeaseTimeoutMS)
+}
+
+// FailoverConfig — передача лидерства узлу, который видит Telegram, когда
+// лидер его не видит (internal/failover).
+type FailoverConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// FailureWindowSeconds — сколько бот должен не получать от Telegram
+	// вообще никакого ответа, чтобы считаться сбойным.
+	FailureWindowSeconds int `yaml:"failure_window_seconds"`
+	// MinFailingBots — минимум сбойных ботов (и не меньше половины
+	// работающих), чтобы считать проблемой сам узел.
+	MinFailingBots int `yaml:"min_failing_bots"`
+	// CooldownSeconds — минимальный интервал между передачами с этого узла.
+	CooldownSeconds int `yaml:"cooldown_seconds"`
+	// CheckIntervalSeconds — как часто принимается решение.
+	CheckIntervalSeconds int `yaml:"check_interval_seconds"`
 }
 
 // PeerConfig — один узел кластера из статической конфигурации.
@@ -132,6 +177,13 @@ func (c Config) Validate() error {
 			slices.Sort(missing)
 			return fmt.Errorf("config: %s required (or set security.insecure: true for local development only)", strings.Join(missing, ", "))
 		}
+	}
+	hb, el, lease := c.Raft.RaftTimeouts()
+	if lease > hb || hb > el {
+		return fmt.Errorf("config: raft timeouts must satisfy leader_lease (%s) <= heartbeat (%s) <= election (%s)", lease, hb, el)
+	}
+	if lease < 5*time.Millisecond {
+		return fmt.Errorf("config: raft.leader_lease_timeout_ms must be at least 5")
 	}
 	for _, p := range c.Raft.Peers {
 		if p.ID == "" || p.RaftAddr == "" || p.GRPCAddr == "" {
@@ -233,6 +285,13 @@ func Default() Config {
 			MessageRetentionPerBot: raftcluster.DefaultMessageRetentionPerBot,
 			JournalRetention:       raftcluster.DefaultJournalRetention,
 			Bootstrap:              true,
+		},
+		Failover: FailoverConfig{
+			Enabled:              true,
+			FailureWindowSeconds: 60,
+			MinFailingBots:       1,
+			CooldownSeconds:      300,
+			CheckIntervalSeconds: 10,
 		},
 		GRPC: GRPCConfig{ListenAddr: ":9090"},
 		HTTP: HTTPConfig{ListenAddr: ":9091"},

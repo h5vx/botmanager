@@ -2,7 +2,6 @@ package telegram
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"github.com/h5vx/botmanager/internal/raftcluster"
@@ -32,6 +31,9 @@ func (r *Runner) pollLoop(ctx context.Context, bot raftcluster.Bot, api *Client)
 		pollCtx, cancel := context.WithTimeout(ctx, r.cfg.longPollTimeout()+5*time.Second)
 		updates, err := api.GetUpdates(pollCtx, offset, int(r.cfg.longPollTimeout().Seconds()), AllowedUpdateKinds)
 		cancel()
+		if ctx.Err() == nil {
+			r.observe(bot.ID, err)
+		}
 
 		if err != nil {
 			if ctx.Err() != nil {
@@ -82,11 +84,10 @@ func (r *Runner) pollLoop(ctx context.Context, bot raftcluster.Bot, api *Client)
 			RecordUpdates: &raftcluster.RecordUpdatesCommand{BotID: bot.ID, NextOffset: next, Updates: batch},
 		}
 		if _, err := r.cluster.Apply(cmd, r.cfg.requestTimeout()); err != nil {
-			if errors.Is(err, raftcluster.ErrNotLeader) {
-				// Лидерство потеряно — раннер вот-вот остановят; обновления
-				// не подтверждены и достанутся новому лидеру.
-				return
-			}
+			// Обновления не подтверждены Telegram и не потеряются: их
+			// получит этот же раннер при повторе или новый лидер. При
+			// потере лидерства раннер остановит Manager (через ctx), а
+			// при сорвавшейся передаче лидерства опрос должен продолжиться.
 			wait := retry.next()
 			r.logger.Warn("record_updates failed",
 				"event", "telegram.record_updates_error", "bot_id", bot.ID, "updates", len(updates), "retry_in", wait.String(), "error", err.Error())

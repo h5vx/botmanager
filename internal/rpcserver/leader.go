@@ -51,10 +51,10 @@ func requireLeader(node *raftcluster.Node) error {
 func applyError(err error) error {
 	switch {
 	case errors.Is(err, raftcluster.ErrNotLeader):
-		// Lost leadership between requireLeader's check and this Apply
-		// call — a narrow race, not a bug; same remedy as requireLeader's
-		// own rejection.
-		return status.Error(codes.FailedPrecondition, "lost raft leadership while applying the command; retry")
+		// Leadership moved (or is being transferred) between
+		// requireLeader's check and this Apply call — retryable: by the
+		// time the client retries, another node leads.
+		return status.Error(codes.Unavailable, "raft leadership is changing; retry")
 	case errors.Is(err, raftcluster.ErrBotNotFound):
 		return status.Error(codes.NotFound, err.Error())
 	case errors.Is(err, raftcluster.ErrBotAlreadyExists):

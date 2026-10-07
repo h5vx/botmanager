@@ -60,6 +60,9 @@ func (r *Runner) processOutbound(ctx context.Context, bot raftcluster.Bot, api *
 		sendCtx, cancel := context.WithTimeout(ctx, r.cfg.requestTimeout())
 		result, err := api.SendMessage(sendCtx, msg.ChatID, msg.Text, 0, msg.Buttons)
 		cancel()
+		if ctx.Err() == nil {
+			r.observe(bot.ID, err)
+		}
 
 		if err == nil {
 			r.updateDelivery(msg, raftcluster.DeliveryStatusSent, msg.Delivery.Retries, "", time.Time{}, time.Now().UTC(), result.MessageID)

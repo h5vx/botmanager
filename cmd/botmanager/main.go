@@ -6,6 +6,8 @@
 //   - internal/botlifecycle.Manager, запускающий/останавливающий раннеров
 //     ботов (internal/telegram) в зависимости от лидерства и состояния
 //     ботов;
+//   - internal/failover.Monitor: передаёт лидерство соседу, если этот узел
+//     перестал видеть Telegram, а сосед видит;
 //   - HTTP-сервер наблюдаемости на :9091 (/healthz, /readyz, /metrics);
 //   - gRPC-сервер на :9090 с BotAdmin/Messaging/Maintenance
 //     (internal/rpcserver) поверх mTLS, с пересылкой записей лидеру, плюс
@@ -31,9 +33,12 @@ import (
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
 
+	"github.com/hashicorp/raft"
+
 	"github.com/h5vx/botmanager/api/botmanagerpb"
 	"github.com/h5vx/botmanager/internal/botlifecycle"
 	"github.com/h5vx/botmanager/internal/config"
+	"github.com/h5vx/botmanager/internal/failover"
 	"github.com/h5vx/botmanager/internal/observability"
 	"github.com/h5vx/botmanager/internal/raftcluster"
 	"github.com/h5vx/botmanager/internal/rpcserver"
@@ -81,7 +86,11 @@ func main() {
 		peers = append(peers, raftcluster.NodeInfo{ID: p.ID, RaftAddr: p.RaftAddr, GRPCAddr: p.GRPCAddr})
 	}
 
+	raftBase := raft.DefaultConfig()
+	raftBase.HeartbeatTimeout, raftBase.ElectionTimeout, raftBase.LeaderLeaseTimeout = cfg.Raft.RaftTimeouts()
+
 	raftCfg := raftcluster.Config{
+		RaftConfig:             raftBase,
 		NodeID:                 cfg.Node.ID,
 		DataDir:                cfg.Node.DataDir,
 		BindAddr:               cfg.Node.RaftBind,
@@ -112,18 +121,40 @@ func main() {
 		SendPollInterval: time.Duration(cfg.Telegram.SendPollIntervalSeconds) * time.Second,
 	}
 
+	peerCreds := insecure.NewCredentials()
+	if sec.mtls != nil {
+		peerCreds = credentials.NewTLS(sec.mtls.Client)
+	}
+	forwarder, err := rpcserver.NewForwarder(node, grpc.WithTransportCredentials(peerCreds))
+	if err != nil {
+		logger.Error("forwarder setup failed", "event", "botmanager.forwarder_failed", "error", err.Error())
+		os.Exit(1)
+	}
+
+	managerCtx, stopManager := context.WithCancel(context.Background())
+	defer stopManager()
+
+	if cfg.Failover.Enabled {
+		monitor := failover.New(failover.Config{
+			FailureWindow:  time.Duration(cfg.Failover.FailureWindowSeconds) * time.Second,
+			MinFailingBots: cfg.Failover.MinFailingBots,
+			Cooldown:       time.Duration(cfg.Failover.CooldownSeconds) * time.Second,
+			CheckInterval:  time.Duration(cfg.Failover.CheckIntervalSeconds) * time.Second,
+		}, node, forwarder, logger)
+		telegramCfg.Health = monitor
+		go monitor.Run(managerCtx)
+	}
+
 	runnerFactory := telegram.NewRunnerFactory(node, telegramCfg, nodeProxy, logger)
 	manager := botlifecycle.NewManager(node, runnerFactory, logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	managerCtx, stopManager := context.WithCancel(context.Background())
-	defer stopManager()
 	go manager.Run(managerCtx)
 
 	httpServer := newHTTPServer(cfg.HTTP.ListenAddr, node)
-	grpcServer, grpcListener, forwarder, err := newGRPCServer(cfg.GRPC.ListenAddr, node, sec, nodeProxy, telegramCfg, logger)
+	grpcServer, grpcListener, err := newGRPCServer(cfg.GRPC.ListenAddr, node, sec, forwarder, nodeProxy, telegramCfg, logger)
 	if err != nil {
 		logger.Error("grpc listen failed", "event", "botmanager.grpc_listen_failed", "error", err.Error())
 		os.Exit(1)
@@ -150,6 +181,13 @@ func main() {
 		logger.Info("shutdown signal received", "event", "botmanager.shutdown_start")
 	case err := <-errCh:
 		logger.Error("server failed", "event", "botmanager.server_failed", "error", err.Error())
+	}
+
+	// Сначала отдаём лидерство другому узлу: кластер получает нового лидера
+	// сразу, а не после истечения heartbeat-таймаута. Раннеры ботов на этом
+	// узле Manager остановит сам — по сигналу потери лидерства.
+	if err := node.HandOffLeadership(); err != nil {
+		logger.Warn("leadership handoff failed", "event", "botmanager.handoff_failed", "error", err.Error())
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -228,23 +266,16 @@ func loadSecurity(cfg config.SecurityConfig, logger *slog.Logger) (securitySetup
 // слушатель порта и регистрирует BotAdmin/Messaging/Maintenance
 // (internal/rpcserver) поверх node, плюс стандартную grpc.health.v1 службу
 // и reflection. Записи, пришедшие на не-лидера, пересылаются лидеру
-// (rpcserver.Forwarder) с сертификатом этого узла.
-func newGRPCServer(addr string, node *raftcluster.Node, sec securitySetup, nodeProxy raftcluster.ProxyConfig, telegramCfg telegram.Config, logger *slog.Logger) (*grpc.Server, net.Listener, *rpcserver.Forwarder, error) {
+// (forwarder — тот же пул соединений к соседям использует failover).
+func newGRPCServer(addr string, node *raftcluster.Node, sec securitySetup, forwarder *rpcserver.Forwarder, nodeProxy raftcluster.ProxyConfig, telegramCfg telegram.Config, logger *slog.Logger) (*grpc.Server, net.Listener, error) {
 	serverCreds := insecure.NewCredentials()
-	peerCreds := insecure.NewCredentials()
 	if sec.mtls != nil {
 		serverCreds = credentials.NewTLS(sec.mtls.Server)
-		peerCreds = credentials.NewTLS(sec.mtls.Client)
-	}
-
-	forwarder, err := rpcserver.NewForwarder(node, grpc.WithTransportCredentials(peerCreds))
-	if err != nil {
-		return nil, nil, nil, err
 	}
 
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 
 	server := grpc.NewServer(
@@ -267,5 +298,5 @@ func newGRPCServer(addr string, node *raftcluster.Node, sec securitySetup, nodeP
 
 	reflection.Register(server)
 
-	return server, lis, forwarder, nil
+	return server, lis, nil
 }

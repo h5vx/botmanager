@@ -41,6 +41,25 @@ raft:
   #  - id: node-2
   #    raft_addr: "10.0.0.2:9092"
   #    grpc_addr: "10.0.0.2:9090"
+  # Таймауты Raft, мс; 0 — умолчания (1000/1000/500). Меньше — быстрее
+  # замена упавшего лидера, но выше риск ложных выборов в медленной сети.
+  # leader_lease <= heartbeat <= election, одинаково на всех узлах.
+  heartbeat_timeout_ms: 0
+  election_timeout_ms: 0
+  leader_lease_timeout_ms: 0
+
+# Передача лидерства, когда лидер перестал видеть Telegram (сеть, прокси),
+# а другой узел его видит — Raft сам такого лидера не заменит. Узел считает
+# проблемой себя, когда не меньше min_failing_bots ботов (и не меньше
+# половины работающих) не получают от Telegram никакого ответа
+# failure_window_seconds подряд. Лидерство уходит только узлу, который
+# проверил доступ к Telegram для этих же ботов (их токен и прокси).
+failover:
+  enabled: true
+  failure_window_seconds: 60
+  min_failing_bots: 1
+  cooldown_seconds: 300
+  check_interval_seconds: 10
 
 grpc:
   listen_addr: ":9090"

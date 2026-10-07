@@ -2,6 +2,7 @@ package raftcluster
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -400,6 +401,16 @@ func (n *Node) Apply(cmd Command, timeout time.Duration) (*ApplyResult, error) {
 
 	future := n.raft.Apply(data, timeout)
 	if err := future.Error(); err != nil {
+		switch {
+		case errors.Is(err, raft.ErrNotLeader), errors.Is(err, raft.ErrLeadershipLost),
+			errors.Is(err, raft.ErrLeadershipTransferInProgress), errors.Is(err, raft.ErrRaftShutdown):
+			// Узел сейчас не может принять запись (не лидер, лидерство
+			// уходит или ушло, узел выключается) — повторять нужно на
+			// другом узле или чуть позже. Команды идемпотентны, поэтому
+			// повтор безопасен даже при ErrLeadershipLost, когда исход
+			// неизвестен.
+			return nil, fmt.Errorf("%w: %v", ErrNotLeader, err)
+		}
 		return nil, fmt.Errorf("raftcluster: apply: %w", err)
 	}
 
@@ -521,6 +532,30 @@ func (n *Node) TransferLeadershipTo(id, address string) error {
 	}
 	future := n.raft.LeadershipTransferToServer(raft.ServerID(id), raft.ServerAddress(address))
 	return future.Error()
+}
+
+// HandOffLeadership transfers leadership to another voter if this node is
+// the leader of a multi-node cluster — called before a graceful shutdown,
+// so the cluster gets a new leader right away instead of waiting for the
+// heartbeat timeout to notice the old one is gone. No-op otherwise.
+func (n *Node) HandOffLeadership() error {
+	if !n.IsLeader() {
+		return nil
+	}
+	servers, err := n.Configuration()
+	if err != nil {
+		return err
+	}
+	voters := 0
+	for _, s := range servers {
+		if s.Suffrage == raft.Voter {
+			voters++
+		}
+	}
+	if voters < 2 {
+		return nil
+	}
+	return n.raft.LeadershipTransfer().Error()
 }
 
 // AddVoter adds a node to the cluster as a voting member and records its

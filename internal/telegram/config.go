@@ -39,6 +39,9 @@ type Config struct {
 	// SendPollInterval is sendLoop's periodic fallback tick; <= 0 =
 	// DefaultSendPollInterval.
 	SendPollInterval time.Duration
+	// Health, if set, is told after every Telegram call whether Telegram
+	// was reachable (see HealthReporter).
+	Health HealthReporter
 }
 
 func (c Config) apiBaseURL() string {

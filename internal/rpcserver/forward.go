@@ -137,6 +137,22 @@ func (f *Forwarder) Conn(addr string) (*grpc.ClientConn, error) {
 	return c, nil
 }
 
+// ProbeTelegram asks the node at grpcAddr whether it reaches Telegram for
+// botID right now (its Maintenance.PingTelegram: getMe with the bot's
+// token through the bot's effective proxy). Used by internal/failover to
+// pick a leadership transfer target that can actually do better.
+func (f *Forwarder) ProbeTelegram(ctx context.Context, grpcAddr, botID string) (bool, error) {
+	conn, err := f.Conn(grpcAddr)
+	if err != nil {
+		return false, err
+	}
+	res, err := botmanagerpb.NewMaintenanceClient(conn).PingTelegram(ctx, &botmanagerpb.PingTelegramRequest{BotId: botID})
+	if err != nil {
+		return false, err
+	}
+	return res.GetSuccess(), nil
+}
+
 // Close closes every pooled connection.
 func (f *Forwarder) Close() {
 	f.mu.Lock()

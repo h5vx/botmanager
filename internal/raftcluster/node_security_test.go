@@ -227,3 +227,32 @@ func TestCluster_MutualTLSTransport(t *testing.T) {
 		t.Fatalf("connection with a foreign-CA certificate was accepted")
 	}
 }
+
+// TestNode_HandOffLeadership: a leader stepping down for a graceful
+// shutdown hands leadership to another voter immediately; on a single-node
+// cluster it is a no-op.
+func TestNode_HandOffLeadership(t *testing.T) {
+	nodes := newInmemCluster(t, 3)
+	leader := waitForLeader(t, nodes, 3*time.Second)
+	if err := leader.HandOffLeadership(); err != nil {
+		t.Fatalf("HandOffLeadership: %v", err)
+	}
+	waitFor(t, 3*time.Second, func() bool {
+		for _, n := range nodes {
+			if n != leader && n.IsLeader() {
+				return true
+			}
+		}
+		return false
+	}, "another node became leader")
+	if leader.IsLeader() {
+		t.Fatal("old leader is still leader")
+	}
+
+	_, trans := raft.NewInmemTransport("solo")
+	solo := newInmemNode(t, "solo", trans, true, nil)
+	waitForLeader(t, []*Node{solo}, 3*time.Second)
+	if err := solo.HandOffLeadership(); err != nil || !solo.IsLeader() {
+		t.Fatalf("single node: err=%v leader=%v", err, solo.IsLeader())
+	}
+}

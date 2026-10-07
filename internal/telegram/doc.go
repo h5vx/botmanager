@@ -62,22 +62,13 @@
 //	Recipient   | UpdateDelivery(FAILED, last_error) — терминально, повторов
 //	            | нет (иначе сообщение вечно висело бы в RETRYING).
 //
-// # Осознанно не реализовано: "проблема узла ⇒ сложить полномочия"
+// # Node-level problems
 //
-// Возможен второй уровень реакции на FailureClassNode: если сбои
-// происходят по НЕСКОЛЬКИМ ботам одновременно на одном узле, это признак
-// проблемы самого узла (недоступен прокси, нет сети), и правильная реакция —
-// узлу сложить лидерские полномочия, чтобы новый лидер (на другой машине,
-// предположительно с рабочей сетью) подхватил ботов. Этот пакет
-// классифицирует отдельные сбои как FailureClassNode и делает локальный
-// backoff/retry для ОДНОГО бота (см. таблицу выше), но не реализует
-// корреляцию "несколько ботов сразу" и не даёт Runner способа сложить
-// лидерство узла — это требует состояния на уровне процесса (счётчик
-// сбоев по всем ботам сразу, окно времени) вне отдельного BotRunner, и
-// физически негде проверить на одной машине разработки без нескольких
-// узлов кластера (по аналогии с одноузловым bootstrap в
-// internal/raftcluster). Сознательное упрощение — см. CLAUDE.md,
-// "Что сознательно пусто".
+// A FailureClassNode failure is handled per bot here (backoff and retry).
+// Whether the node as a whole has lost Telegram — several bots failing at
+// once — is decided outside this package: every call outcome is reported
+// to Config.Health (HealthReporter), and internal/failover hands Raft
+// leadership to a peer that does reach Telegram.
 //
 // # Incoming updates: committed before acknowledged
 //

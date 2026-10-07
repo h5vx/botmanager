@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/h5vx/botmanager/internal/raftcluster"
 )
@@ -157,5 +158,30 @@ func TestGRPCAdvertiseAddr(t *testing.T) {
 	cfg.Node.GRPCAdvertise = "bm-1.internal:9090"
 	if got, _ := cfg.GRPCAdvertiseAddr(); got != "bm-1.internal:9090" {
 		t.Fatalf("explicit = %q", got)
+	}
+}
+
+func TestRaftTimeouts(t *testing.T) {
+	t.Setenv("BOTMANAGER_SECURITY__INSECURE", "true")
+	cfg := Default()
+	hb, el, lease := cfg.Raft.RaftTimeouts()
+	if hb != time.Second || el != time.Second || lease != 500*time.Millisecond {
+		t.Fatalf("defaults = %s %s %s", hb, el, lease)
+	}
+
+	t.Setenv("BOTMANAGER_RAFT__HEARTBEAT_TIMEOUT_MS", "300")
+	t.Setenv("BOTMANAGER_RAFT__ELECTION_TIMEOUT_MS", "300")
+	t.Setenv("BOTMANAGER_RAFT__LEADER_LEASE_TIMEOUT_MS", "150")
+	got, err := Load("does/not/exist.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hb, _, lease := got.Raft.RaftTimeouts(); hb != 300*time.Millisecond || lease != 150*time.Millisecond {
+		t.Fatalf("overridden = %s %s", hb, lease)
+	}
+
+	t.Setenv("BOTMANAGER_RAFT__LEADER_LEASE_TIMEOUT_MS", "400")
+	if _, err := Load("does/not/exist.yaml"); err == nil {
+		t.Fatal("lease > heartbeat accepted")
 	}
 }
