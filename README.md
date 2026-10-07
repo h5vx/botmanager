@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/logo.svg" alt="botmanager logo" width="128" height="128">
+  <img src="https://raw.githubusercontent.com/h5vx/botmanager/main/docs/logo.svg" alt="botmanager logo" width="128" height="128">
 </p>
 
 <h1 align="center">botmanager</h1>
