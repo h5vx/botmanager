@@ -61,45 +61,98 @@ messages. All domain logic lives in the services that call it.
   removing nodes, leadership transfer, Telegram reachability check
   (including through the proxy), streaming state export for backups.
 
-## Quick start (development)
+## Quick start with Docker
 
-Requires Go 1.25+.
+Only Docker is needed. Images for `linux/amd64` and `linux/arm64` are on
+Docker Hub as [`h5vx/botmanager`](https://hub.docker.com/r/h5vx/botmanager).
+
+### Try it in one command
+
+Development mode: no TLS, no authentication, tokens in plaintext, data
+lost with the container. For experiments only.
+
+```bash
+docker run --rm -p 9090:9090 -p 9091:9091 -e BOTMANAGER_SECURITY__INSECURE=true h5vx/botmanager:1
+```
+
+Then call it with `grpcurl -plaintext localhost:9090 ...` (see below).
+
+### Run it properly
+
+**1. Create certificates and the token key** with the tool shipped in the
+image. Everything lands in `./certs`; keep `ca-key.pem` and `token.key`
+secret.
+
+```bash
+mkdir -p certs data
+```
+
+```bash
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/certs:/certs" --entrypoint /app/botmanager-certs h5vx/botmanager:1 init -out /certs
+```
+
+```bash
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/certs:/certs" --entrypoint /app/botmanager-certs h5vx/botmanager:1 issue -out /certs -name node -hosts localhost,127.0.0.1
+```
+
+```bash
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/certs:/certs" --entrypoint /app/botmanager-certs h5vx/botmanager:1 issue -out /certs -name client
+```
+
+The node certificate is named `node` because that is what the image's
+config expects (`/etc/botmanager/certs/node.pem`); `-hosts` lists the
+names clients use to reach the node. `client.pem` is for your service.
+
+**2. Start the node.** `--user` lets the container read the key files
+and write `./data`, both owned by you.
+
+```bash
+docker run -d --name botmanager --user "$(id -u):$(id -g)" -p 9090:9090 -p 9091:9091 -v "$PWD/certs:/etc/botmanager/certs:ro" -v "$PWD/data:/var/lib/botmanager" h5vx/botmanager:1
+```
+
+**3. Check it.**
+
+```bash
+curl localhost:9091/readyz
+```
+
+```bash
+grpcurl -cacert certs/ca.pem -cert certs/client.pem -key certs/client-key.pem localhost:9090 botmanager.v1.Maintenance/GetClusterStatus
+```
+
+### First bot
+
+Use the same `grpcurl` flags (or `-plaintext` in development mode).
+Create a bot (it starts `disabled`), enable it, send a message, watch
+events:
+
+```bash
+grpcurl -cacert certs/ca.pem -cert certs/client.pem -key certs/client-key.pem -d '{"display_name": "My bot", "token": "123456:ABC..."}' localhost:9090 botmanager.v1.BotAdmin/CreateBot
+```
+
+```bash
+grpcurl -cacert certs/ca.pem -cert certs/client.pem -key certs/client-key.pem -d '{"id": "<bot_id>", "state": "BOT_STATE_ENABLED"}' localhost:9090 botmanager.v1.BotAdmin/SetBotState
+```
+
+```bash
+grpcurl -cacert certs/ca.pem -cert certs/client.pem -key certs/client-key.pem -d '{"idempotency_key": "hello-1", "bot_id": "<bot_id>", "chat_id": -1001234567890, "text": "Hello!"}' localhost:9090 botmanager.v1.Messaging/Send
+```
+
+```bash
+grpcurl -cacert certs/ca.pem -cert certs/client.pem -key certs/client-key.pem -d '{}' localhost:9090 botmanager.v1.Messaging/Subscribe
+```
+
+Repeating `Send` with the same `idempotency_key` does not create a
+duplicate.
+
+### From source
 
 ```bash
 make run
 ```
 
-This starts one node with [config/dev.yaml](config/dev.yaml): data in
-`./data`, gRPC on `127.0.0.1:9090`, **no TLS and no token encryption**.
-Development mode is for local experiments only.
-
-The server has reflection enabled, so you can try it with `grpcurl`.
-Create a bot (it starts in the `disabled` state):
-
-```bash
-grpcurl -plaintext -d '{"display_name": "My bot", "token": "123456:ABC..."}' localhost:9090 botmanager.v1.BotAdmin/CreateBot
-```
-
-Enable it:
-
-```bash
-grpcurl -plaintext -d '{"id": "<bot_id>", "state": "BOT_STATE_ENABLED"}' localhost:9090 botmanager.v1.BotAdmin/SetBotState
-```
-
-Send a message:
-
-```bash
-grpcurl -plaintext -d '{"idempotency_key": "hello-1", "bot_id": "<bot_id>", "chat_id": -1001234567890, "text": "Hello!"}' localhost:9090 botmanager.v1.Messaging/Send
-```
-
-Subscribe to events:
-
-```bash
-grpcurl -plaintext -d '{}' localhost:9090 botmanager.v1.Messaging/Subscribe
-```
-
-Repeating `Send` with the same `idempotency_key` does not create a
-duplicate; it returns the existing message.
+Starts one development-mode node with [config/dev.yaml](config/dev.yaml)
+(data in `./data`, gRPC on `127.0.0.1:9090`).
 
 ## Running securely
 
@@ -192,27 +245,11 @@ Ports:
 | `9091` | HTTP: `/healthz`, `/readyz`, `/metrics` |
 | `9092` | Raft transport between nodes |
 
-### Docker
+### Docker image
 
-Images for `linux/amd64` and `linux/arm64` are published to Docker Hub as
-[`h5vx/botmanager`](https://hub.docker.com/r/h5vx/botmanager) for every
-release tag (`1.2.3`, `1.2`, `1` and `latest`):
-
-```bash
-docker pull h5vx/botmanager:1
-```
-
-Or build it yourself:
-
-```bash
-docker build -t botmanager .
-```
-
-```bash
-docker run --rm -p 9090:9090 -p 9091:9091 -p 9092:9092 -v botmanager-data:/var/lib/botmanager -v "$PWD/certs:/etc/botmanager/certs:ro" -e BOTMANAGER_SECURITY__CERT_FILE=/etc/botmanager/certs/node-1.pem -e BOTMANAGER_SECURITY__KEY_FILE=/etc/botmanager/certs/node-1-key.pem h5vx/botmanager:1
-```
-
-The image is distroless and runs as an unprivileged user.
+Release tags publish `1.2.3`, `1.2`, `1` and `latest`. The image is
+distroless and runs as an unprivileged user; to build it yourself run
+`docker build -t botmanager .`.
 
 ## Using from Go
 

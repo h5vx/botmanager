@@ -44,7 +44,7 @@ RUN mkdir -p /out/data && chmod 755 /out/data
 ARG TARGETOS=linux
 ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" \
-    -o /out/botmanager ./cmd/botmanager
+    -o /out/ ./cmd/botmanager ./cmd/botmanager-certs
 
 FROM gcr.io/distroless/static-debian12:nonroot AS final
 
@@ -62,6 +62,11 @@ WORKDIR /app
 # gcr.io/distroless/*:nonroot, задан числом, чтобы не зависеть от записи в
 # /etc/passwd на этапе COPY.
 COPY --from=builder --chown=65532:65532 --chmod=755 /out/botmanager /app/botmanager
+# Генератор CA, сертификатов и ключа токенов — чтобы подготовить security.*
+# можно было без установленного Go:
+#   docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/certs:/certs" \
+#     --entrypoint /app/botmanager-certs h5vx/botmanager init -out /certs
+COPY --from=builder --chown=65532:65532 --chmod=755 /out/botmanager-certs /app/botmanager-certs
 COPY --from=builder --chown=65532:65532 /src/config /app/config
 # /var/lib/botmanager — node.data_dir по умолчанию (config/config.yaml).
 # Копируем уже готовый (755, см. builder-стадию выше) пустой каталог с

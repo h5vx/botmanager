@@ -1,5 +1,8 @@
 # Публикация Docker-образа в Docker Hub (h5vx/botmanager) при пуше тега
 # версии вида v1.2.3. Теги модуля api/ (api/v1.2.3) образ не собирают.
+# Перед публикацией образ проходит smoke-тест по шагам quickstart из README
+# (scripts/docker-smoke.sh). Ручной запуск (workflow_dispatch) выполняет
+# тесты и smoke-тест без публикации.
 #
 # Секрет репозитория DOCKERHUB_TOKEN — access token Docker Hub с правом
 # Read & Write для пользователя h5vx.
@@ -9,6 +12,7 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -43,8 +47,29 @@ jobs:
           go test -race ./...
           (cd api && go test -race ./...)
 
-  publish:
+  smoke:
     needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: botmanager:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Quickstart smoke test
+        run: scripts/docker-smoke.sh botmanager:smoke
+
+  publish:
+    needs: smoke
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
