@@ -397,3 +397,7 @@ Each package's doc comment describes its design decisions.
   on the node in question.
 - **Custom metrics** (`botmanager_is_leader`, `botmanager_bots_running`)
   are not added yet.
+
+## License
+
+[MIT](LICENSE)
