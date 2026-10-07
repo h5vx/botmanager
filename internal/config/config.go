@@ -31,6 +31,7 @@ type Config struct {
 	Proxy         ProxyConfig         `yaml:"proxy"`
 	Telegram      TelegramConfig      `yaml:"telegram"`
 	Failover      FailoverConfig      `yaml:"failover"`
+	Web           WebConfig           `yaml:"web"`
 	Security      SecurityConfig      `yaml:"security"`
 	Observability ObservabilityConfig `yaml:"observability"`
 }
@@ -143,6 +144,48 @@ func (p *PeerList) UnmarshalText(text []byte) error {
 	return nil
 }
 
+// WebConfig — необязательный веб-интерфейс администратора (internal/webui).
+type WebConfig struct {
+	Enabled    bool   `yaml:"enabled"`
+	ListenAddr string `yaml:"listen_addr"`
+	// TLS — HTTPS с сертификатом узла (security.cert_file). false — обычный
+	// HTTP, только за reverse proxy, который сам терминирует TLS.
+	TLS bool `yaml:"tls"`
+	// Users — логины с bcrypt-хешами паролей (botmanager -hash-password).
+	Users UserList `yaml:"users"`
+	// SessionTTLMinutes — время жизни сессии.
+	SessionTTLMinutes int `yaml:"session_ttl_minutes"`
+}
+
+// WebUser — один пользователь веб-интерфейса.
+type WebUser struct {
+	Username     string `yaml:"username"`
+	PasswordHash string `yaml:"password_hash"`
+}
+
+// UserList — список пользователей. В YAML — обычный список, в переменной
+// окружения (BOTMANAGER_WEB__USERS) — строка "user:hash" через запятую
+// (в bcrypt-хеше нет ни ":", ни ",").
+type UserList []WebUser
+
+// UnmarshalText разбирает строковую форму UserList.
+func (u *UserList) UnmarshalText(text []byte) error {
+	var out UserList
+	for _, item := range strings.Split(string(text), ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		name, hash, ok := strings.Cut(item, ":")
+		if !ok || name == "" || hash == "" {
+			return fmt.Errorf("user %q: want username:password_hash", item)
+		}
+		out = append(out, WebUser{Username: name, PasswordHash: hash})
+	}
+	*u = out
+	return nil
+}
+
 // SecurityConfig — mTLS для gRPC API и Raft-транспорта и ключ шифрования
 // токенов ботов. Без них узел не стартует, если явно не включён
 // insecure-режим (только для локальной разработки: всё ходит открытым
@@ -185,6 +228,16 @@ func (c Config) Validate() error {
 	if lease < 5*time.Millisecond {
 		return fmt.Errorf("config: raft.leader_lease_timeout_ms must be at least 5")
 	}
+	if c.Web.Enabled {
+		if len(c.Web.Users) == 0 {
+			return fmt.Errorf("config: web.enabled requires at least one entry in web.users")
+		}
+		for _, u := range c.Web.Users {
+			if u.Username == "" || !strings.HasPrefix(u.PasswordHash, "$2") {
+				return fmt.Errorf("config: web.users entry %q: username and a bcrypt password_hash (botmanager -hash-password) are required", u.Username)
+			}
+		}
+	}
 	for _, p := range c.Raft.Peers {
 		if p.ID == "" || p.RaftAddr == "" || p.GRPCAddr == "" {
 			return fmt.Errorf("config: raft.peers entry %+v: id, raft_addr and grpc_addr are required", p)
@@ -193,10 +246,36 @@ func (c Config) Validate() error {
 	return nil
 }
 
-// GRPCAdvertiseAddr возвращает gRPC-адрес узла для остальных узлов:
-// node.grpc_advertise_addr или, если он пуст, хост Raft-адреса с портом
-// grpc.listen_addr.
+// SelfPeer возвращает запись raft.peers для самого этого узла, если она
+// есть. Так на всех узлах можно держать один и тот же список: адреса из
+// записи о себе — ровно те, по которым узел знают остальные, поэтому они
+// важнее node.raft_advertise_addr/grpc_advertise_addr.
+func (c Config) SelfPeer() (PeerConfig, bool) {
+	for _, p := range c.Raft.Peers {
+		if p.ID == c.Node.ID {
+			return p, true
+		}
+	}
+	return PeerConfig{}, false
+}
+
+// RaftAdvertiseAddr возвращает Raft-адрес узла для остальных узлов: из
+// записи о себе в raft.peers, иначе node.raft_advertise_addr (пусто —
+// raft_bind_addr).
+func (c Config) RaftAdvertiseAddr() string {
+	if self, ok := c.SelfPeer(); ok {
+		return self.RaftAddr
+	}
+	return c.Node.RaftAdvertise
+}
+
+// GRPCAdvertiseAddr возвращает gRPC-адрес узла для остальных узлов: из
+// записи о себе в raft.peers, иначе node.grpc_advertise_addr, иначе хост
+// Raft-адреса с портом grpc.listen_addr.
 func (c Config) GRPCAdvertiseAddr() (string, error) {
+	if self, ok := c.SelfPeer(); ok {
+		return self.GRPCAddr, nil
+	}
 	if c.Node.GRPCAdvertise != "" {
 		return c.Node.GRPCAdvertise, nil
 	}
@@ -285,6 +364,12 @@ func Default() Config {
 			MessageRetentionPerBot: raftcluster.DefaultMessageRetentionPerBot,
 			JournalRetention:       raftcluster.DefaultJournalRetention,
 			Bootstrap:              true,
+		},
+		Web: WebConfig{
+			Enabled:           false,
+			ListenAddr:        ":9093",
+			TLS:               true,
+			SessionTTLMinutes: 720,
 		},
 		Failover: FailoverConfig{
 			Enabled:              true,

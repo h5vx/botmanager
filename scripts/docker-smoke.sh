@@ -36,11 +36,16 @@ certs issue -out /certs -name node -hosts localhost,127.0.0.1
 certs issue -out /certs -name client
 ls certs
 
-echo "--- secure node"
+echo "--- web password hash from the image"
+HASH=$(printf 'smoke-password\n' | docker run --rm -i --entrypoint /app/botmanager "$IMAGE" -hash-password 2>/dev/null)
+case "$HASH" in '$2'*) ;; *) echo "unexpected hash: $HASH" >&2; exit 1 ;; esac
+
+echo "--- secure node (with web interface)"
 docker run -d --name "$NAME" --user "$U" \
-	-p 9090:9090 -p 9091:9091 \
+	-p 9090:9090 -p 9091:9091 -p 9093:9093 \
 	-v "$PWD/certs:/etc/botmanager/certs:ro" \
 	-v "$PWD/data:/var/lib/botmanager" \
+	-e BOTMANAGER_WEB__ENABLED=true -e "BOTMANAGER_WEB__USERS=admin:$HASH" \
 	"$IMAGE" >/dev/null
 wait_ready 9091 "$NAME"
 curl -fsS http://127.0.0.1:9091/readyz
@@ -56,6 +61,14 @@ mtls=(-cacert /certs/ca.pem -cert /certs/client.pem -key /certs/client-key.pem)
 echo "--- mTLS call"
 grpc "${mtls[@]}" localhost:9090 botmanager.v1.Maintenance/GetClusterStatus | tee status.json
 grep -Eq '"leader(Id|_id)": "node-1"' status.json
+
+echo "--- web interface over HTTPS"
+curl -fsS --cacert certs/ca.pem https://localhost:9093/ | grep -q '<title>botmanager</title>'
+code=$(curl -sS -o /dev/null -w '%{http_code}' --cacert certs/ca.pem https://localhost:9093/api/overview)
+[ "$code" = 401 ] || { echo "anonymous overview: $code" >&2; exit 1; }
+curl -fsS --cacert certs/ca.pem -c web.jar -H 'X-Botmanager-Request: 1' -H 'Content-Type: application/json' \
+	-d '{"username":"admin","password":"smoke-password"}' https://localhost:9093/api/login >/dev/null
+curl -fsS --cacert certs/ca.pem -b web.jar https://localhost:9093/api/overview | grep -q '"leader_id":"node-1"'
 
 echo "--- plaintext call must be rejected"
 if grpc -plaintext localhost:9090 list >/dev/null 2>&1; then

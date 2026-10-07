@@ -42,6 +42,7 @@ type MaintenanceServer struct {
 	httpTimeout time.Duration
 	logger      *slog.Logger
 	peers       PeerDialer
+	runtime     NodeRuntime
 }
 
 // PeerDialer gives MaintenanceServer connections to other nodes' gRPC

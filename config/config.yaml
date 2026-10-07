@@ -86,6 +86,23 @@ telegram:
   # стенд) — пусто означает официальный api.telegram.org.
   api_base_url_override: ""
 
+# Веб-интерфейс администратора (по умолчанию выключен): статистика и память
+# узлов, состав кластера (назначить лидера, добавить/удалить узел), боты
+# (создать, включить/выключить, удалить, проверить Telegram с любого узла).
+# Хеш пароля: echo 'пароль' | botmanager -hash-password
+# Через окружение: BOTMANAGER_WEB__USERS='admin:$2a$10$...'
+web:
+  enabled: false
+  listen_addr: ":9093"
+  # true — HTTPS с сертификатом узла (security.cert_file); браузеру нужен
+  # ca.pem кластера как доверенный CA. false — обычный HTTP, только за
+  # reverse proxy, который сам терминирует TLS.
+  tls: true
+  session_ttl_minutes: 720
+  users: []
+  #  - username: admin
+  #    password_hash: "$2a$10$..."
+
 # mTLS для gRPC API и Raft-транспорта и ключ шифрования токенов ботов.
 # Сгенерировать для разработки или небольшой установки:
 #   go run ./cmd/botmanager-certs init  -out certs

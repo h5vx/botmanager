@@ -448,6 +448,44 @@ message ClusterStatus {
 
 message ExportStateRequest {}
 
+// NodeStats — состояние и статистика одного узла (Maintenance.GetNodeStats).
+// Счётчики ботов и сообщений — из реплицированного состояния, поэтому на
+// всех узлах совпадают с точностью до задержки репликации; остальное —
+// свойства самого процесса.
+message NodeStats {
+  string node_id = 1;
+  string version = 2;
+  google.protobuf.Timestamp started_at = 3;
+
+  // Raft: "Leader" / "Follower" / "Candidate" / "Shutdown".
+  string raft_state = 4;
+  uint64 raft_term = 5;
+  uint64 last_log_index = 6;
+  uint64 commit_index = 7;
+  uint64 applied_index = 8;
+
+  // Память процесса (runtime.MemStats): heap_alloc — живые объекты кучи,
+  // sys — всего получено у ОС.
+  uint64 heap_alloc_bytes = 9;
+  uint64 heap_sys_bytes = 10;
+  uint64 sys_bytes = 11;
+  int32 goroutines = 12;
+  // Размер node.data_dir на диске (журнал Raft и снимки).
+  uint64 data_dir_bytes = 13;
+
+  // Раннеры ботов, работающие на этом узле (ненулевое только у лидера).
+  int32 running_bots = 14;
+  int32 bots_total = 15;
+  // Ключи — имена BotState без префикса: "DISABLED", "ENABLED", ...
+  map<string, int32> bots_by_state = 16;
+  int64 messages_total = 17;
+  // Ключи — имена DeliveryStatus без префикса: "PENDING", "SENT", ...
+  map<string, int64> messages_by_status = 18;
+  uint64 journal_latest_sequence = 19;
+  int32 journal_retained = 20;
+  int32 chats_known = 21;
+}
+
 // AddNodeRequest — добавить узел в кластер голосующим членом. Узел должен
 // быть уже запущен (без bootstrap) и доступен по raft_address.
 message AddNodeRequest {
@@ -505,6 +543,9 @@ service Maintenance {
   rpc PingTelegram(PingTelegramRequest) returns (PingResult);
   // AddNode/RemoveNode меняют состав Raft-кластера. Как и любая запись,
   // выполняются на лидере (вызов на другом узле пересылается лидеру).
+  // GetNodeStats — статистика узла, на который пришёл вызов (не
+  // пересылается; чтобы получить статистику другого узла, вызывайте его).
+  rpc GetNodeStats(Empty) returns (NodeStats);
   rpc AddNode(AddNodeRequest) returns (ClusterStatus);
   rpc RemoveNode(RemoveNodeRequest) returns (ClusterStatus);
 }

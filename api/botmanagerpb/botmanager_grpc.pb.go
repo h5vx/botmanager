@@ -1010,6 +1010,7 @@ const (
 	Maintenance_ExportState_FullMethodName        = "/botmanager.v1.Maintenance/ExportState"
 	Maintenance_TransferLeadership_FullMethodName = "/botmanager.v1.Maintenance/TransferLeadership"
 	Maintenance_PingTelegram_FullMethodName       = "/botmanager.v1.Maintenance/PingTelegram"
+	Maintenance_GetNodeStats_FullMethodName       = "/botmanager.v1.Maintenance/GetNodeStats"
 	Maintenance_AddNode_FullMethodName            = "/botmanager.v1.Maintenance/AddNode"
 	Maintenance_RemoveNode_FullMethodName         = "/botmanager.v1.Maintenance/RemoveNode"
 )
@@ -1032,6 +1033,9 @@ type MaintenanceClient interface {
 	PingTelegram(ctx context.Context, in *PingTelegramRequest, opts ...grpc.CallOption) (*PingResult, error)
 	// AddNode/RemoveNode меняют состав Raft-кластера. Как и любая запись,
 	// выполняются на лидере (вызов на другом узле пересылается лидеру).
+	// GetNodeStats — статистика узла, на который пришёл вызов (не
+	// пересылается; чтобы получить статистику другого узла, вызывайте его).
+	GetNodeStats(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*NodeStats, error)
 	AddNode(ctx context.Context, in *AddNodeRequest, opts ...grpc.CallOption) (*ClusterStatus, error)
 	RemoveNode(ctx context.Context, in *RemoveNodeRequest, opts ...grpc.CallOption) (*ClusterStatus, error)
 }
@@ -1093,6 +1097,16 @@ func (c *maintenanceClient) PingTelegram(ctx context.Context, in *PingTelegramRe
 	return out, nil
 }
 
+func (c *maintenanceClient) GetNodeStats(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*NodeStats, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(NodeStats)
+	err := c.cc.Invoke(ctx, Maintenance_GetNodeStats_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *maintenanceClient) AddNode(ctx context.Context, in *AddNodeRequest, opts ...grpc.CallOption) (*ClusterStatus, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ClusterStatus)
@@ -1131,6 +1145,9 @@ type MaintenanceServer interface {
 	PingTelegram(context.Context, *PingTelegramRequest) (*PingResult, error)
 	// AddNode/RemoveNode меняют состав Raft-кластера. Как и любая запись,
 	// выполняются на лидере (вызов на другом узле пересылается лидеру).
+	// GetNodeStats — статистика узла, на который пришёл вызов (не
+	// пересылается; чтобы получить статистику другого узла, вызывайте его).
+	GetNodeStats(context.Context, *Empty) (*NodeStats, error)
 	AddNode(context.Context, *AddNodeRequest) (*ClusterStatus, error)
 	RemoveNode(context.Context, *RemoveNodeRequest) (*ClusterStatus, error)
 	mustEmbedUnimplementedMaintenanceServer()
@@ -1154,6 +1171,9 @@ func (UnimplementedMaintenanceServer) TransferLeadership(context.Context, *Trans
 }
 func (UnimplementedMaintenanceServer) PingTelegram(context.Context, *PingTelegramRequest) (*PingResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method PingTelegram not implemented")
+}
+func (UnimplementedMaintenanceServer) GetNodeStats(context.Context, *Empty) (*NodeStats, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetNodeStats not implemented")
 }
 func (UnimplementedMaintenanceServer) AddNode(context.Context, *AddNodeRequest) (*ClusterStatus, error) {
 	return nil, status.Error(codes.Unimplemented, "method AddNode not implemented")
@@ -1247,6 +1267,24 @@ func _Maintenance_PingTelegram_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Maintenance_GetNodeStats_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MaintenanceServer).GetNodeStats(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Maintenance_GetNodeStats_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MaintenanceServer).GetNodeStats(ctx, req.(*Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Maintenance_AddNode_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(AddNodeRequest)
 	if err := dec(in); err != nil {
@@ -1301,6 +1339,10 @@ var Maintenance_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PingTelegram",
 			Handler:    _Maintenance_PingTelegram_Handler,
+		},
+		{
+			MethodName: "GetNodeStats",
+			Handler:    _Maintenance_GetNodeStats_Handler,
 		},
 		{
 			MethodName: "AddNode",

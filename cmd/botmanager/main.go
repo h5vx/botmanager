@@ -50,7 +50,13 @@ const serviceName = "botmanager"
 
 func main() {
 	configPath := flag.String("config", "config/config.yaml", "путь к YAML-файлу конфигурации")
+	hashPassword := flag.Bool("hash-password", false, "прочитать пароль из stdin, напечатать bcrypt-хеш для web.users и выйти")
 	flag.Parse()
+	if *hashPassword {
+		hashPasswordMain()
+		return
+	}
+	startedAt := time.Now()
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -94,7 +100,7 @@ func main() {
 		NodeID:                 cfg.Node.ID,
 		DataDir:                cfg.Node.DataDir,
 		BindAddr:               cfg.Node.RaftBind,
-		AdvertiseAddr:          cfg.Node.RaftAdvertise,
+		AdvertiseAddr:          cfg.RaftAdvertiseAddr(),
 		Bootstrap:              cfg.Raft.Bootstrap,
 		MessageRetentionPerBot: cfg.Raft.MessageRetentionPerBot,
 		JournalRetention:       cfg.Raft.JournalRetention,
@@ -154,13 +160,41 @@ func main() {
 	go manager.Run(managerCtx)
 
 	httpServer := newHTTPServer(cfg.HTTP.ListenAddr, node)
-	grpcServer, grpcListener, err := newGRPCServer(cfg.GRPC.ListenAddr, node, sec, forwarder, nodeProxy, telegramCfg, logger)
+	nodeRuntime := rpcserver.NodeRuntime{
+		Version:     cfg.Observability.Version,
+		StartedAt:   startedAt,
+		DataDir:     cfg.Node.DataDir,
+		RunningBots: func() int { return len(manager.RunningBotIDs()) },
+	}
+	grpcServer, grpcListener, err := newGRPCServer(cfg.GRPC.ListenAddr, node, sec, forwarder, nodeRuntime, nodeProxy, telegramCfg, logger)
 	if err != nil {
 		logger.Error("grpc listen failed", "event", "botmanager.grpc_listen_failed", "error", err.Error())
 		os.Exit(1)
 	}
 
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
+
+	var webServer *http.Server
+	if cfg.Web.Enabled {
+		srv, tlsServing, err := newWebServer(cfg.Web, cfg.Node.ID, grpcAdvertise, sec, forwarder, logger)
+		if err != nil {
+			logger.Error("web interface setup failed", "event", "botmanager.web_failed", "error", err.Error())
+			os.Exit(1)
+		}
+		webServer = srv
+		go func() {
+			logger.Info("web interface listening", "event", "botmanager.web_listening", "addr", cfg.Web.ListenAddr, "tls", tlsServing)
+			var err error
+			if tlsServing {
+				err = srv.ListenAndServeTLS("", "")
+			} else {
+				err = srv.ListenAndServe()
+			}
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- err
+			}
+		}()
+	}
 
 	go func() {
 		logger.Info("http server listening", "event", "botmanager.http_listening", "addr", cfg.HTTP.ListenAddr)
@@ -193,6 +227,9 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	if webServer != nil {
+		_ = webServer.Shutdown(shutdownCtx)
+	}
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Error("http shutdown error", "event", "botmanager.http_shutdown_error", "error", err.Error())
 	}
@@ -237,8 +274,9 @@ func newHTTPServer(addr string, node *raftcluster.Node) *http.Server {
 // securitySetup is what loadSecurity derives from config: mTLS
 // configurations and the token cipher, both nil in insecure mode.
 type securitySetup struct {
-	mtls   *security.MTLS
-	cipher *raftcluster.TokenCipher
+	mtls     *security.MTLS
+	cipher   *raftcluster.TokenCipher
+	tokenKey []byte
 }
 
 func loadSecurity(cfg config.SecurityConfig, logger *slog.Logger) (securitySetup, error) {
@@ -259,7 +297,7 @@ func loadSecurity(cfg config.SecurityConfig, logger *slog.Logger) (securitySetup
 	if err != nil {
 		return securitySetup{}, err
 	}
-	return securitySetup{mtls: m, cipher: cipher}, nil
+	return securitySetup{mtls: m, cipher: cipher, tokenKey: key}, nil
 }
 
 // newGRPCServer собирает gRPC-сервер (mTLS, если не insecure-режим),
@@ -267,7 +305,7 @@ func loadSecurity(cfg config.SecurityConfig, logger *slog.Logger) (securitySetup
 // (internal/rpcserver) поверх node, плюс стандартную grpc.health.v1 службу
 // и reflection. Записи, пришедшие на не-лидера, пересылаются лидеру
 // (forwarder — тот же пул соединений к соседям использует failover).
-func newGRPCServer(addr string, node *raftcluster.Node, sec securitySetup, forwarder *rpcserver.Forwarder, nodeProxy raftcluster.ProxyConfig, telegramCfg telegram.Config, logger *slog.Logger) (*grpc.Server, net.Listener, error) {
+func newGRPCServer(addr string, node *raftcluster.Node, sec securitySetup, forwarder *rpcserver.Forwarder, nodeRuntime rpcserver.NodeRuntime, nodeProxy raftcluster.ProxyConfig, telegramCfg telegram.Config, logger *slog.Logger) (*grpc.Server, net.Listener, error) {
 	serverCreds := insecure.NewCredentials()
 	if sec.mtls != nil {
 		serverCreds = credentials.NewTLS(sec.mtls.Server)
@@ -290,6 +328,7 @@ func newGRPCServer(addr string, node *raftcluster.Node, sec securitySetup, forwa
 	botmanagerpb.RegisterMessagingServer(server, rpcserver.NewMessagingServer(node, nodeProxy, apiBaseURL, httpTimeout, logger))
 	maintenance := rpcserver.NewMaintenanceServer(node, nodeProxy, apiBaseURL, httpTimeout, logger)
 	maintenance.SetPeerDialer(forwarder)
+	maintenance.SetNodeRuntime(nodeRuntime)
 	botmanagerpb.RegisterMaintenanceServer(server, maintenance)
 
 	healthServer := health.NewServer()

@@ -74,10 +74,11 @@ COPY --from=builder --chown=65532:65532 /src/config /app/config
 # shell, ни mkdir.
 COPY --from=builder --chown=65532:65532 /out/data /var/lib/botmanager
 
-# 9090 — gRPC API, 9091 — /healthz /readyz /metrics, 9092 — Raft.
+# 9090 — gRPC API, 9091 — /healthz /readyz /metrics, 9092 — Raft,
+# 9093 — веб-интерфейс (если включён web.enabled).
 # Сертификаты и ключ токенов ожидаются в /etc/botmanager/certs (см.
 # security.* в config/config.yaml) — смонтируйте их томом или секретом.
-EXPOSE 9090 9091 9092
+EXPOSE 9090 9091 9092 9093
 
 USER nonroot:nonroot
 

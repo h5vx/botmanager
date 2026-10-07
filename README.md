@@ -57,6 +57,9 @@ messages. All domain logic lives in the services that call it.
   leaves botmanager, so the check is done here.
 - **Go client library** with automatic failover, retries and a
   self-resuming `Subscribe`.
+- **Optional web interface** with login: cluster members and their memory,
+  leader assignment, adding and removing nodes, bots, delivery statistics
+  and Telegram checks from any node.
 - **Operations**: cluster status with real peer health checks, adding and
   removing nodes, leadership transfer, Telegram reachability check
   (including through the proxy), streaming state export for backups.
@@ -215,6 +218,9 @@ The same as an environment variable:
 BOTMANAGER_RAFT__PEERS=node-2/10.0.0.2:9092/10.0.0.2:9090,node-3/10.0.0.3:9092/10.0.0.3:9090
 ```
 
+The list may also include the node itself; then every node can use the
+same list, and the node takes its own advertise addresses from its entry.
+
 Start all nodes; they elect a leader on their own. To grow a running
 cluster, start the new node with `raft.bootstrap: false` and call
 `Maintenance.AddNode` on any node; `Maintenance.RemoveNode` takes one out.
@@ -244,12 +250,61 @@ Ports:
 | `9090` | gRPC: `BotAdmin`, `Messaging`, `Maintenance`, `grpc.health.v1`, reflection |
 | `9091` | HTTP: `/healthz`, `/readyz`, `/metrics` |
 | `9092` | Raft transport between nodes |
+| `9093` | Web interface (only with `web.enabled`) |
 
 ### Docker image
 
 Release tags publish `1.2.3`, `1.2`, `1` and `latest`. The image is
 distroless and runs as an unprivileged user; to build it yourself run
 `docker build -t botmanager .`.
+
+## Web interface
+
+An optional administration interface is built into the binary (no
+separate frontend to deploy). It shows:
+
+- cluster members with their role, addresses, memory, data size, Raft
+  position and version; make any node the leader, add or remove nodes;
+- bots with their state and failure reason; create, enable, disable and
+  delete bots, view their recent messages;
+- message counts by delivery status and other statistics;
+- Telegram reachability checks run on any node you choose, for the node's
+  own route or for a specific bot's token and proxy.
+
+Every node can serve it: changes go to the leader like any other write,
+and each node's statistics are fetched from that node.
+
+**1. Create a password hash:**
+
+```bash
+docker run --rm -i --entrypoint /app/botmanager h5vx/botmanager:1 -hash-password
+```
+
+Type the password and press Enter (or `echo 'password' | botmanager
+-hash-password` with the binary).
+
+**2. Enable it** on the nodes you want to open it on:
+
+```yaml
+web:
+  enabled: true
+  listen_addr: ":9093"
+  users:
+    - username: admin
+      password_hash: "$2a$10$..."
+```
+
+or, with Docker, add `-p 9093:9093 -e BOTMANAGER_WEB__ENABLED=true -e
+BOTMANAGER_WEB__USERS='admin:$2a$10$...'` to the `docker run` command.
+
+**3. Open** `https://<node>:9093`. The page is served over HTTPS with the
+node certificate, so the browser has to trust the cluster CA (import
+`certs/ca.pem`) or will show a warning. Behind a reverse proxy that
+terminates TLS itself, set `web.tls: false`.
+
+Sessions last `web.session_ttl_minutes` (12 hours) and are valid on every
+node. Failed logins are limited to five per five minutes per client
+address; every change is written to the log with the user's name.
 
 ## Using from Go
 
@@ -328,8 +383,9 @@ create and update but is never returned in any response.
 `AnswerCallback`, `GetMessage`, `GetMessages`, `ListMessages`,
 `Subscribe`.
 
-**`Maintenance`** — operations: `GetClusterStatus`, `ExportState`,
-`TransferLeadership`, `PingTelegram`, `AddNode`, `RemoveNode`.
+**`Maintenance`** — operations: `GetClusterStatus`, `GetNodeStats`,
+`ExportState`, `TransferLeadership`, `PingTelegram`, `AddNode`,
+`RemoveNode`.
 
 Any node accepts any call. While no leader is known (during an election)
 writes fail with `UNAVAILABLE`; the Go client retries them.
@@ -418,6 +474,7 @@ internal/failover/       hands leadership to a node that reaches Telegram
 internal/telegram/       Bot API client, long polling, sending, proxy
 internal/rpcserver/      gRPC services, forwarding writes to the leader
 internal/security/       mTLS configuration, token key loading
+internal/webui/          web interface: JSON API, login, embedded pages
 internal/devcerts/       certificate generation
 ```
 

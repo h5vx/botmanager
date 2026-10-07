@@ -185,3 +185,23 @@ func TestRaftTimeouts(t *testing.T) {
 		t.Fatal("lease > heartbeat accepted")
 	}
 }
+
+func TestSelfPeerOverridesAdvertise(t *testing.T) {
+	cfg := Default()
+	cfg.Node.ID = "node-2"
+	cfg.Node.RaftAdvertise = "127.0.0.1:9092"
+	cfg.Raft.Peers = PeerList{
+		{ID: "node-1", RaftAddr: "10.0.0.1:9092", GRPCAddr: "10.0.0.1:9090"},
+		{ID: "node-2", RaftAddr: "10.0.0.2:9092", GRPCAddr: "10.0.0.2:9090"},
+	}
+	if got := cfg.RaftAdvertiseAddr(); got != "10.0.0.2:9092" {
+		t.Fatalf("raft advertise = %q", got)
+	}
+	if got, _ := cfg.GRPCAdvertiseAddr(); got != "10.0.0.2:9090" {
+		t.Fatalf("grpc advertise = %q", got)
+	}
+	cfg.Raft.Peers = cfg.Raft.Peers[:1]
+	if got := cfg.RaftAdvertiseAddr(); got != "127.0.0.1:9092" {
+		t.Fatalf("without self entry = %q", got)
+	}
+}
