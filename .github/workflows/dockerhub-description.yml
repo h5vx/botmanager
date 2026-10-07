@@ -1,0 +1,34 @@
+# Обновляет overview образа h5vx/botmanager на Docker Hub из README.md:
+# при изменении README в main и вручную (Actions → Run workflow).
+# Относительные ссылки README (логотип, файлы репозитория) переписываются
+# в абсолютные ссылки на GitHub, иначе на Docker Hub они битые.
+#
+# DOCKERHUB_TOKEN должен быть access token со scope "Read, Write, Delete":
+# менять описание репозитория Docker Hub с меньшими правами не позволяет.
+name: dockerhub-description
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - README.md
+      - .github/workflows/dockerhub-description.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  description:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: peter-evans/dockerhub-description@v4
+        with:
+          username: h5vx
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: h5vx/botmanager
+          short-description: A highly available Telegram Bot API gateway with a gRPC interface.
+          readme-filepath: ./README.md
+          enable-url-completion: true

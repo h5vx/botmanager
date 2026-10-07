@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/h5vx/botmanager/actions/workflows/docker.yml"><img src="https://github.com/h5vx/botmanager/actions/workflows/docker.yml/badge.svg?event=push" alt="Docker image build"></a>
-  <a href="https://hub.docker.com/r/h5vx/botmanager"><img src="https://img.shields.io/docker/v/h5vx/botmanager?sort=semver&label=docker" alt="Docker Hub"></a>
+  <a href="https://hub.docker.com/r/h5vx/botmanager"><img src="https://img.shields.io/docker/v/h5vx/botmanager?sort=semver&label=docker%20hub" alt="Docker Hub"></a>
 </p>
 
 A distributed gateway to the Telegram Bot API. botmanager holds bot
