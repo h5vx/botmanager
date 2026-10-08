@@ -36,6 +36,14 @@ type IncomingUpdate struct {
 	MessageID  int64       `json:"message_id,omitempty"`
 	Text       string      `json:"text,omitempty"`
 
+	// Профиль отправителя (incoming_message, callback_query). В записях,
+	// сделанных до появления этих полей, они пусты.
+	FromUsername     string `json:"from_username,omitempty"`
+	FromFirstName    string `json:"from_first_name,omitempty"`
+	FromLastName     string `json:"from_last_name,omitempty"`
+	FromLanguageCode string `json:"from_language_code,omitempty"`
+	FromIsBot        bool   `json:"from_is_bot,omitempty"`
+
 	CallbackQueryID string `json:"callback_query_id,omitempty"`
 	CallbackData    string `json:"callback_data,omitempty"`
 

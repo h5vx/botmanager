@@ -96,11 +96,16 @@ func TestJournalEntryToProto(t *testing.T) {
 
 	msg := journalEntryToProto(raftcluster.JournalEntry{
 		Seq: 7, Kind: raftcluster.JournalIncomingMessage, BotID: "b1", OccurredAt: now,
-		Update: &raftcluster.IncomingUpdate{ChatID: 1, MessageID: 2, FromUserID: 3, Text: "hi", ReceivedAt: now},
+		Update: &raftcluster.IncomingUpdate{ChatID: 1, MessageID: 2, FromUserID: 3, Text: "hi", ReceivedAt: now,
+			FromUsername: "anna_k", FromFirstName: "Анна", FromLastName: "К", FromLanguageCode: "ru"},
 	})
 	im := msg.GetIncomingMessage()
 	if im == nil || im.GetBotId() != "b1" || im.GetText() != "hi" || !msg.GetOccurredAt().AsTime().Equal(now) || msg.GetSequence() != 7 {
 		t.Fatalf("incoming_message = %+v", msg)
+	}
+	if f := im.GetFrom(); f.GetId() != 3 || f.GetUsername() != "anna_k" || f.GetFirstName() != "Анна" ||
+		f.GetLastName() != "К" || f.GetLanguageCode() != "ru" || f.GetIsBot() {
+		t.Fatalf("incoming_message.from = %+v", f)
 	}
 
 	cb := journalEntryToProto(raftcluster.JournalEntry{
@@ -109,6 +114,16 @@ func TestJournalEntryToProto(t *testing.T) {
 	})
 	if cb.GetCallbackQuery() == nil || cb.GetCallbackQuery().GetCallbackQueryId() != "cq1" {
 		t.Fatalf("callback_query = %+v", cb)
+	}
+	// records written before the sender profile existed: id only
+	if f := cb.GetCallbackQuery().GetFrom(); f.GetId() != 3 || f.GetFirstName() != "" {
+		t.Fatalf("callback_query.from = %+v", f)
+	}
+	// no sender at all (channel post): from is absent
+	ch := journalEntryToProto(raftcluster.JournalEntry{Kind: raftcluster.JournalIncomingMessage, BotID: "b1",
+		Update: &raftcluster.IncomingUpdate{ChatID: -100, Text: "post"}})
+	if ch.GetIncomingMessage().GetFrom() != nil {
+		t.Fatalf("channel post must have no from: %+v", ch)
 	}
 
 	cm := journalEntryToProto(raftcluster.JournalEntry{

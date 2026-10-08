@@ -102,6 +102,22 @@ func (s botIDFilterSet) matches(botID string) bool {
 	return ok
 }
 
+// senderToProto is the sender's profile, or nil when the update has no
+// sender (channel posts).
+func senderToProto(u *raftcluster.IncomingUpdate) *botmanagerpb.User {
+	if u.FromUserID == 0 {
+		return nil
+	}
+	return &botmanagerpb.User{
+		Id:           u.FromUserID,
+		Username:     u.FromUsername,
+		FirstName:    u.FromFirstName,
+		LastName:     u.FromLastName,
+		LanguageCode: u.FromLanguageCode,
+		IsBot:        u.FromIsBot,
+	}
+}
+
 // journalEntryToProto converts one journal entry to a botmanagerpb.Update,
 // or nil for a kind this server does not know (defensive: every kind
 // written today has a case).
@@ -120,6 +136,7 @@ func journalEntryToProto(e raftcluster.JournalEntry) *botmanagerpb.Update {
 			FromUserId: u.FromUserID,
 			Text:       u.Text,
 			ReceivedAt: toProtoTime(u.ReceivedAt),
+			From:       senderToProto(u),
 		}}
 	case raftcluster.JournalCallbackQuery:
 		if e.Update == nil {
@@ -133,6 +150,7 @@ func journalEntryToProto(e raftcluster.JournalEntry) *botmanagerpb.Update {
 			MessageId:       u.MessageID,
 			FromUserId:      u.FromUserID,
 			Data:            u.CallbackData,
+			From:            senderToProto(u),
 		}}
 	case raftcluster.JournalChatMemberChanged:
 		if e.Update == nil {

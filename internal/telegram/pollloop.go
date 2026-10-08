@@ -115,6 +115,16 @@ func (r *Runner) chatTitle(ctx context.Context, api *Client, chatID int64) strin
 	return chat.Title
 }
 
+// setSender copies the sender's profile into the journal record.
+func setSender(ev *raftcluster.IncomingUpdate, from apiUser) {
+	ev.FromUserID = from.ID
+	ev.FromUsername = from.Username
+	ev.FromFirstName = from.FirstName
+	ev.FromLastName = from.LastName
+	ev.FromLanguageCode = from.LanguageCode
+	ev.FromIsBot = from.IsBot
+}
+
 // convertUpdate turns one raw Telegram update into a raftcluster
 // IncomingUpdate, or reports ok=false for a kind we did not request/do not
 // handle (the offset still advances past it).
@@ -123,29 +133,28 @@ func convertUpdate(u apiUpdate) (raftcluster.IncomingUpdate, bool) {
 
 	switch {
 	case u.Message != nil:
-		var fromID int64
-		if u.Message.From != nil {
-			fromID = u.Message.From.ID
-		}
-		return raftcluster.IncomingUpdate{
+		ev := raftcluster.IncomingUpdate{
 			Kind:       raftcluster.JournalIncomingMessage,
 			UpdateID:   u.UpdateID,
 			ChatID:     u.Message.Chat.ID,
-			FromUserID: fromID,
 			MessageID:  u.Message.MessageID,
 			Text:       u.Message.Text,
 			ReceivedAt: now,
-		}, true
+		}
+		if u.Message.From != nil {
+			setSender(&ev, *u.Message.From)
+		}
+		return ev, true
 
 	case u.CallbackQuery != nil:
 		ev := raftcluster.IncomingUpdate{
 			Kind:            raftcluster.JournalCallbackQuery,
 			UpdateID:        u.UpdateID,
-			FromUserID:      u.CallbackQuery.From.ID,
 			CallbackQueryID: u.CallbackQuery.ID,
 			CallbackData:    u.CallbackQuery.Data,
 			ReceivedAt:      now,
 		}
+		setSender(&ev, u.CallbackQuery.From)
 		if u.CallbackQuery.Message != nil {
 			ev.ChatID = u.CallbackQuery.Message.Chat.ID
 			ev.MessageID = u.CallbackQuery.Message.MessageID

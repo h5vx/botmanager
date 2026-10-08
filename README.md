@@ -34,7 +34,8 @@ messages. All domain logic lives in the services that call it.
   through Raft before they are acknowledged to Telegram, so a leader crash
   loses nothing, and every event carries a cluster-wide sequence number.
 - **Resumable event stream** `Messaging.Subscribe`: incoming messages,
-  inline button presses, chat membership changes, delivery status changes
+  inline button presses (with the sender's
+  username and name), chat membership changes, delivery status changes
   and bot state changes. Reconnect with the last sequence you saw and get
   exactly what you missed — from any node.
 - **Reliable sending**: mandatory `idempotency_key`, a priority queue

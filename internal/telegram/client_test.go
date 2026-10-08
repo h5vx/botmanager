@@ -297,15 +297,16 @@ func TestClient_GetUpdates_ParsesMessageCallbackAndChatMember(t *testing.T) {
 					"message": map[string]any{
 						"message_id": 10,
 						"chat":       map[string]any{"id": 555},
-						"from":       map[string]any{"id": 777},
-						"text":       "привет",
+						"from": map[string]any{"id": 777, "is_bot": false, "first_name": "Анна", "last_name": "К",
+							"username": "anna_k", "language_code": "ru"},
+						"text": "привет",
 					},
 				},
 				{
 					"update_id": 1002,
 					"callback_query": map[string]any{
 						"id":   "cbq-1",
-						"from": map[string]any{"id": 778},
+						"from": map[string]any{"id": 778, "first_name": "Bob"},
 						"data": "rsvp:yes",
 						"message": map[string]any{
 							"message_id": 11,
@@ -338,10 +339,17 @@ func TestClient_GetUpdates_ParsesMessageCallbackAndChatMember(t *testing.T) {
 	if !ok || msgEv.Kind != raftcluster.JournalIncomingMessage || msgEv.Text != "привет" || msgEv.ChatID != 555 {
 		t.Errorf("updates[0] converted = %+v (ok=%v)", msgEv, ok)
 	}
+	if msgEv.FromUserID != 777 || msgEv.FromUsername != "anna_k" || msgEv.FromFirstName != "Анна" ||
+		msgEv.FromLastName != "К" || msgEv.FromLanguageCode != "ru" || msgEv.FromIsBot {
+		t.Errorf("updates[0] sender = %+v", msgEv)
+	}
 
 	cbEv, ok := convertUpdate(updates[1])
 	if !ok || cbEv.Kind != raftcluster.JournalCallbackQuery || cbEv.CallbackData != "rsvp:yes" || cbEv.ChatID != 555 {
 		t.Errorf("updates[1] converted = %+v (ok=%v)", cbEv, ok)
+	}
+	if cbEv.FromUserID != 778 || cbEv.FromFirstName != "Bob" || cbEv.FromUsername != "" {
+		t.Errorf("updates[1] sender = %+v", cbEv)
 	}
 
 	memberEv, ok := convertUpdate(updates[2])

@@ -359,6 +359,19 @@ message SubscribeRequest {
   optional uint64 after_sequence = 2;
 }
 
+// Отправитель входящего сообщения или нажатия кнопки — поля Telegram User
+// как их прислал Telegram. Имена — то, что пользователь указал в профиле;
+// username и last_name могут быть пустыми. id совпадает с from_user_id.
+// В событиях, записанных до появления этого сообщения, from отсутствует.
+message User {
+  int64 id = 1;
+  string username = 2;
+  string first_name = 3;
+  string last_name = 4;
+  string language_code = 5; // IETF-тег языка клиента, если Telegram его передал
+  bool is_bot = 6;
+}
+
 // Виды обновления в потоке Subscribe (не только входящие сообщения).
 message IncomingMessage {
   string bot_id = 1;
@@ -367,6 +380,7 @@ message IncomingMessage {
   int64 from_user_id = 4;
   string text = 5;
   google.protobuf.Timestamp received_at = 6;
+  User from = 7; // отсутствует, если у сообщения нет отправителя (каналы)
 }
 
 message CallbackQuery {
@@ -376,6 +390,7 @@ message CallbackQuery {
   int64 message_id = 4;
   int64 from_user_id = 5;
   string data = 6;
+  User from = 7;
 }
 
 message MessageStatusChanged {
