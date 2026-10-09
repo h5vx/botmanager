@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -151,7 +153,7 @@ func (n *testNet) dialOpts() []grpc.DialOption {
 	}
 }
 
-func startClusterNode(t *testing.T, tn *testNet, node *raftcluster.Node, addr string) *testClusterNode {
+func startClusterNode(t *testing.T, tn *testNet, node *raftcluster.Node, addr, apiBaseURL string) *testClusterNode {
 	t.Helper()
 	lis := bufconn.Listen(1 << 20)
 	tn.listeners[addr] = lis
@@ -163,8 +165,8 @@ func startClusterNode(t *testing.T, tn *testNet, node *raftcluster.Node, addr st
 	t.Cleanup(fw.Close)
 
 	server := grpc.NewServer(grpc.ChainUnaryInterceptor(fw.UnaryInterceptor))
-	botmanagerpb.RegisterBotAdminServer(server, NewBotAdminServer(node, raftcluster.ProxyConfig{}, "", 0, nil))
-	botmanagerpb.RegisterMessagingServer(server, NewMessagingServer(node, raftcluster.ProxyConfig{}, "", 0, nil))
+	botmanagerpb.RegisterBotAdminServer(server, NewBotAdminServer(node, raftcluster.ProxyConfig{}, apiBaseURL, 0, nil))
+	botmanagerpb.RegisterMessagingServer(server, NewMessagingServer(node, raftcluster.ProxyConfig{}, apiBaseURL, 0, nil))
 	maint := NewMaintenanceServer(node, raftcluster.ProxyConfig{}, "", 0, nil)
 	maint.SetPeerDialer(fw)
 	botmanagerpb.RegisterMaintenanceServer(server, maint)
@@ -253,7 +255,7 @@ func TestCluster_FollowerForwardsWritesAndServesSubscribe(t *testing.T) {
 	nodes := make([]*testClusterNode, 3)
 	for i := 0; i < 3; i++ {
 		rn := openInmemNode(t, fmt.Sprintf("n%d", i), trans[i], true, servers, fmt.Sprintf("grpc-%d", i), peers)
-		nodes[i] = startClusterNode(t, tn, rn, fmt.Sprintf("grpc-%d", i))
+		nodes[i] = startClusterNode(t, tn, rn, fmt.Sprintf("grpc-%d", i), "")
 	}
 
 	var leader *testClusterNode
@@ -321,7 +323,7 @@ func TestCluster_FollowerForwardsWritesAndServesSubscribe(t *testing.T) {
 
 	// AddNode через фолловера (пересылается лидеру).
 	joiner := openInmemNode(t, "n3", trans[3], false, nil, "grpc-3", nil)
-	startClusterNode(t, tn, joiner, "grpc-3")
+	startClusterNode(t, tn, joiner, "grpc-3", "")
 	st, err = f.maint.AddNode(ctx, &botmanagerpb.AddNodeRequest{NodeId: "n3", RaftAddress: string(addrs[3]), GrpcAddress: "grpc-3"})
 	if err != nil {
 		t.Fatalf("AddNode: %v", err)
@@ -340,5 +342,86 @@ func TestCluster_FollowerForwardsWritesAndServesSubscribe(t *testing.T) {
 	}
 	if _, err := f.maint.RemoveNode(ctx, &botmanagerpb.RemoveNodeRequest{NodeId: "nope"}); status.Code(err) != codes.NotFound {
 		t.Fatalf("RemoveNode(unknown) = %v, want NotFound", err)
+	}
+}
+
+// TestCluster_LiveTelegramCallsRunOnLeader gives every node its own fake
+// Telegram server and calls AnswerCallback on a follower: the call must
+// reach Telegram from the leader (the node that talks to Telegram), not
+// from the follower that received it.
+func TestCluster_LiveTelegramCallsRunOnLeader(t *testing.T) {
+	const n = 3
+	tn := &testNet{listeners: map[string]*bufconn.Listener{}}
+	addrs := make([]raft.ServerAddress, n)
+	trans := make([]*raft.InmemTransport, n)
+	for i := 0; i < n; i++ {
+		addrs[i], trans[i] = raft.NewInmemTransport(raft.ServerAddress(fmt.Sprintf("raft-%d", i)))
+	}
+	for i := 0; i < n; i++ {
+		for j := 0; j < n; j++ {
+			if i != j {
+				trans[i].Connect(addrs[j], trans[j])
+			}
+		}
+	}
+	var servers []raft.Server
+	var peers []raftcluster.NodeInfo
+	for i := 0; i < n; i++ {
+		servers = append(servers, raft.Server{ID: raft.ServerID(fmt.Sprintf("n%d", i)), Address: addrs[i]})
+		peers = append(peers, raftcluster.NodeInfo{ID: fmt.Sprintf("n%d", i), RaftAddr: string(addrs[i]), GRPCAddr: fmt.Sprintf("grpc-%d", i)})
+	}
+
+	var calls [n]atomic.Int32
+	nodes := make([]*testClusterNode, n)
+	for i := 0; i < n; i++ {
+		srv := newFakeTelegramServer(t, func(method string, _ map[string]any) (int, map[string]any) {
+			if method == "answerCallbackQuery" {
+				calls[i].Add(1)
+			}
+			return http.StatusOK, map[string]any{"ok": true, "result": true}
+		})
+		rn := openInmemNode(t, fmt.Sprintf("n%d", i), trans[i], true, servers, fmt.Sprintf("grpc-%d", i), peers)
+		nodes[i] = startClusterNode(t, tn, rn, fmt.Sprintf("grpc-%d", i), srv.URL)
+	}
+
+	leader, follower := -1, -1
+	waitUntil(t, 5*time.Second, func() bool {
+		leader, follower = -1, -1
+		for i, cn := range nodes {
+			if cn.node.IsLeader() {
+				leader = i
+			} else {
+				follower = i
+			}
+		}
+		return leader >= 0 && follower >= 0
+	}, "leader elected")
+	waitUntil(t, 5*time.Second, func() bool {
+		return len(nodes[follower].node.ListNodes()) == n
+	}, "node registry replicated")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	f := nodes[follower]
+	bot, err := f.botAdmin.CreateBot(ctx, &botmanagerpb.CreateBotRequest{DisplayName: "live", Token: "123:tok"})
+	if err != nil {
+		t.Fatalf("CreateBot: %v", err)
+	}
+	waitUntil(t, 5*time.Second, func() bool {
+		_, ok := f.node.GetBot(bot.GetId())
+		return ok
+	}, "bot replicated to the follower")
+
+	if _, err := f.msg.AnswerCallback(ctx, &botmanagerpb.AnswerCallbackRequest{BotId: bot.GetId(), CallbackQueryId: "cb-1"}); err != nil {
+		t.Fatalf("AnswerCallback on follower: %v", err)
+	}
+	for i := range nodes {
+		want := int32(0)
+		if i == leader {
+			want = 1
+		}
+		if got := calls[i].Load(); got != want {
+			t.Fatalf("node n%d (leader n%d) made %d answerCallbackQuery calls, want %d", i, leader, got, want)
+		}
 	}
 }

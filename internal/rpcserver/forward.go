@@ -3,6 +3,7 @@ package rpcserver
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 
@@ -25,8 +26,7 @@ import (
 const forwardedMetadataKey = "x-botmanager-forwarded-by"
 
 // writeMethods are the RPCs that change replicated state and therefore
-// must run on the Raft leader. Everything else (reads, live Telegram calls,
-// Subscribe) is served by whichever node receives it.
+// must run on the Raft leader.
 var writeMethods = []string{
 	botmanagerpb.BotAdmin_CreateBot_FullMethodName,
 	botmanagerpb.BotAdmin_UpdateBot_FullMethodName,
@@ -40,13 +40,35 @@ var writeMethods = []string{
 	botmanagerpb.Maintenance_RemoveNode_FullMethodName,
 }
 
-// Forwarder transparently forwards write RPCs received by a follower to the
-// current leader, so clients may talk to any node. It also keeps the pool
+// liveTelegramMethods are the RPCs that call Telegram synchronously. They
+// change no replicated state, but are forwarded to the leader too: the
+// leader is the node that talks to Telegram (internal/failover moves
+// leadership to a node that reaches it), while the node that received the
+// call may not reach Telegram at all. Unlike writes they do not need
+// leadership, so when no leader is known, or a forwarded call arrives
+// after leadership moved, they run on the receiving node.
+// Maintenance.PingTelegram is deliberately absent: it checks Telegram from
+// this particular node. Reads, VerifyInitData and Subscribe are served by
+// whichever node receives them.
+var liveTelegramMethods = []string{
+	botmanagerpb.BotAdmin_GetChat_FullMethodName,
+	botmanagerpb.BotAdmin_ListChats_FullMethodName,
+	botmanagerpb.BotAdmin_GetUserProfilePhoto_FullMethodName,
+	botmanagerpb.Messaging_EditMessage_FullMethodName,
+	botmanagerpb.Messaging_DeleteMessage_FullMethodName,
+	botmanagerpb.Messaging_PinMessage_FullMethodName,
+	botmanagerpb.Messaging_UnpinMessage_FullMethodName,
+	botmanagerpb.Messaging_AnswerCallback_FullMethodName,
+}
+
+// Forwarder transparently forwards write and live Telegram RPCs received by
+// a follower to the current leader, so clients may talk to any node. It also keeps the pool
 // of connections to peers that MaintenanceServer uses for health probes.
 type Forwarder struct {
 	node     *raftcluster.Node
 	dialOpts []grpc.DialOption
-	replies  map[string]protoreflect.MessageType // full method -> response type
+	replies  map[string]protoreflect.MessageType // full method -> response type, for every forwarded method
+	live     map[string]bool                     // liveTelegramMethods
 
 	mu    sync.Mutex
 	conns map[string]*grpc.ClientConn
@@ -55,18 +77,23 @@ type Forwarder struct {
 // NewForwarder builds a Forwarder. dialOpts must carry the transport
 // credentials for node-to-node calls (the node's own mTLS certificate).
 func NewForwarder(node *raftcluster.Node, dialOpts ...grpc.DialOption) (*Forwarder, error) {
-	replies := make(map[string]protoreflect.MessageType, len(writeMethods))
-	for _, m := range writeMethods {
+	replies := make(map[string]protoreflect.MessageType, len(writeMethods)+len(liveTelegramMethods))
+	live := make(map[string]bool, len(liveTelegramMethods))
+	for _, m := range slices.Concat(writeMethods, liveTelegramMethods) {
 		mt, err := responseType(m)
 		if err != nil {
 			return nil, err
 		}
 		replies[m] = mt
 	}
+	for _, m := range liveTelegramMethods {
+		live[m] = true
+	}
 	return &Forwarder{
 		node:     node,
 		dialOpts: dialOpts,
 		replies:  replies,
+		live:     live,
 		conns:    make(map[string]*grpc.ClientConn),
 	}, nil
 }
@@ -93,18 +120,26 @@ func responseType(fullMethod string) (protoreflect.MessageType, error) {
 	return protoregistry.GlobalTypes.FindMessageByName(md.Output().FullName())
 }
 
-// UnaryInterceptor forwards write RPCs to the leader when this node is not
-// the leader; all other calls go to the local handler.
+// UnaryInterceptor forwards write and live Telegram RPCs to the leader
+// when this node is not the leader; all other calls go to the local
+// handler.
 func (f *Forwarder) UnaryInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-	mt, isWrite := f.replies[info.FullMethod]
-	if !isWrite || f.node.IsLeader() {
+	mt, forwarded := f.replies[info.FullMethod]
+	if !forwarded || f.node.IsLeader() {
 		return handler(ctx, req)
 	}
+	live := f.live[info.FullMethod]
 	if md, ok := metadata.FromIncomingContext(ctx); ok && len(md.Get(forwardedMetadataKey)) > 0 {
+		if live {
+			return handler(ctx, req)
+		}
 		return nil, status.Error(codes.Unavailable, "raft leadership moved while the request was being forwarded; retry")
 	}
 	leader, ok := f.node.LeaderInfo()
 	if !ok || leader.GRPCAddr == "" {
+		if live {
+			return handler(ctx, req)
+		}
 		return nil, status.Error(codes.Unavailable, "raft leader (or its gRPC address) is not currently known on this node; retry")
 	}
 	conn, err := f.Conn(leader.GRPCAddr)

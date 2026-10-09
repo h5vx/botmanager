@@ -40,7 +40,7 @@
 //     streams Node.ExportSnapshot's JSON output in bounded chunks.
 //     AddNode/RemoveNode change cluster membership.
 //
-// # Leadership — writes are forwarded to the leader
+// # Leadership — writes and live Telegram calls are forwarded to the leader
 //
 // Forwarder (forward.go) is a unary server interceptor: a write RPC
 // (writeMethods) received by a follower is sent on to the current leader's
@@ -52,6 +52,10 @@
 // UNAVAILABLE as well. Every RPC that calls Node.Apply additionally checks
 // leadership itself (requireLeader in leader.go), so a server built
 // without the Forwarder answers FAILED_PRECONDITION naming the leader.
-// Reads, live Telegram calls and Subscribe are served by whichever node
-// receives them.
+// Live Telegram calls (liveTelegramMethods: EditMessage, AnswerCallback,
+// GetChat, ...) are forwarded the same way, because the leader is the node
+// that reaches Telegram; needing no leadership, they fall back to the
+// receiving node when no leader is known or leadership moved in transit.
+// PingTelegram, reads, VerifyInitData and Subscribe are served by
+// whichever node receives them.
 package rpcserver

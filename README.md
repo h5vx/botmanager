@@ -27,8 +27,10 @@ messages. All domain logic lives in the services that call it.
   Telegram (network, proxy) while another node still has one, leadership
   moves to that node. A graceful shutdown hands leadership over instantly
   instead of waiting for a timeout.
-- **Talk to any node.** Writes sent to a follower are forwarded to the
-  leader transparently; reads and the event stream are served by every
+- **Talk to any node.** Writes and live Telegram calls (`EditMessage`,
+  `AnswerCallback`, `GetChat`, ...) sent to a follower are forwarded to the
+  leader transparently, so they work even through a node that cannot
+  reach Telegram itself; reads and the event stream are served by every
   node.
 - **No lost or duplicated incoming updates.** Updates are committed
   through Raft before they are acknowledged to Telegram, so a leader crash

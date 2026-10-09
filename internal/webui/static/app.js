@@ -338,7 +338,7 @@ function nodesView() {
   return h("div", {},
     h("h2", {}, "Cluster members"),
     h("div", { class: "table-wrap" }, h("table", {},
-      h("thead", {}, h("tr", {}, ["Node", "Status", "Addresses", "Memory", "Data", "Raft", "Bots", "Version", ""].map((t) => h("th", {}, t)))),
+      h("thead", {}, h("tr", {}, ["Node", "Status", "Addresses", "Memory", "Data", "Raft", "Active bots", "Version", ""].map((t) => h("th", t === "Active bots" ? { title: "Bots this node is serving right now: polling and sending through Telegram. Only the leader serves bots; every node knows all of them." } : {}, t)))),
       h("tbody", {}, rows),
     )),
     h("h2", {}, "Add a node"),
