@@ -173,3 +173,31 @@ func TestCheck_MinFailingBots(t *testing.T) {
 		t.Fatalf("transferred = %v", cl.transferred)
 	}
 }
+
+func TestCheck_WindowCountsFromLastResponse(t *testing.T) {
+	m, cl, pr, ck := setup(Config{FailureWindow: 15 * time.Second})
+	pr.reach["g2"] = map[string]bool{"a": true}
+	m.TelegramReachable("a")
+	// Зависший long poll сообщает о сбое только по таймауту — через 35 с
+	// после последнего ответа; окно к этому моменту уже истекло.
+	ck.add(35 * time.Second)
+	m.TelegramUnreachable("a", nil)
+	if !m.Check(context.Background()) || cl.transferred[0] != "n2" {
+		t.Fatalf("transferred = %v", cl.transferred)
+	}
+}
+
+func TestCheck_SelfCheckSuccessKeepsLeadership(t *testing.T) {
+	m, cl, pr, ck := setup(Config{FailureWindow: 15 * time.Second})
+	pr.reach["g1"] = map[string]bool{"a": true} // свежий getMe с самого узла проходит
+	pr.reach["g2"] = map[string]bool{"a": true}
+	m.TelegramReachable("a")
+	ck.add(30 * time.Second)
+	m.TelegramUnreachable("a", nil)
+	if m.Check(context.Background()) || len(cl.transferred) != 0 {
+		t.Fatalf("one failed call moved leadership: %v", cl.transferred)
+	}
+	if len(pr.probes) != 1 || pr.probes[0] != "g1/a" {
+		t.Fatalf("probes = %v, want only the self-check", pr.probes)
+	}
+}

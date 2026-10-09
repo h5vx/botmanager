@@ -9,10 +9,14 @@
 // telegram.HealthReporter) and, while this node is leader, periodically
 // decides whether the node itself is the problem:
 //
-//   - at least MinFailingBots running bots, and at least half of them, have
-//     had no response from Telegram at all (FailureClassNode) for
-//     FailureWindow — a single bot failing alongside healthy ones points at
+//   - at least MinFailingBots running bots, and at least half of them, are
+//     failing (FailureClassNode) and have had no response from Telegram at
+//     all for FailureWindow, counted from their last response, not from
+//     the first failure — a hung long poll reports its failure only when it
+//     times out — a single bot failing alongside healthy ones points at
 //     that bot, not at the node;
+//   - this node's own check (Maintenance.PingTelegram on itself: a fresh
+//     getMe) fails too, so one transient error never moves leadership;
 //   - a peer is found that does reach Telegram for those same bots (its own
 //     Maintenance.PingTelegram with the bot's token and effective proxy),
 //     so a Telegram-wide outage or one bot's broken proxy never makes
@@ -49,17 +53,17 @@ type PeerProber interface {
 
 // Config tunes the monitor; zero values mean the defaults below.
 type Config struct {
-	// FailureWindow is how long a bot must go without any response from
-	// Telegram before it counts as failing (default 60s).
+	// FailureWindow is how long a failing bot must have gone without any
+	// response from Telegram before it counts (default 15s).
 	FailureWindow time.Duration
 	// MinFailingBots is the minimum number of failing bots (default 1).
 	MinFailingBots int
 	// Cooldown is the minimum time between two transfers started by this
 	// node (default 5m).
 	Cooldown time.Duration
-	// CheckInterval is how often the decision is made (default 10s).
+	// CheckInterval is how often the decision is made (default 2s).
 	CheckInterval time.Duration
-	// ProbeTimeout bounds one peer probe (default 15s).
+	// ProbeTimeout bounds one probe of this node or a peer (default 5s).
 	ProbeTimeout time.Duration
 	// MaxProbedBots caps how many failing bots are checked on each peer
 	// (default 3).
@@ -68,7 +72,7 @@ type Config struct {
 
 func (c Config) withDefaults() Config {
 	if c.FailureWindow <= 0 {
-		c.FailureWindow = 60 * time.Second
+		c.FailureWindow = 15 * time.Second
 	}
 	if c.MinFailingBots <= 0 {
 		c.MinFailingBots = 1
@@ -77,10 +81,10 @@ func (c Config) withDefaults() Config {
 		c.Cooldown = 5 * time.Minute
 	}
 	if c.CheckInterval <= 0 {
-		c.CheckInterval = 10 * time.Second
+		c.CheckInterval = 2 * time.Second
 	}
 	if c.ProbeTimeout <= 0 {
-		c.ProbeTimeout = 15 * time.Second
+		c.ProbeTimeout = 5 * time.Second
 	}
 	if c.MaxProbedBots <= 0 {
 		c.MaxProbedBots = 3
@@ -98,7 +102,8 @@ type Monitor struct {
 	now     func() time.Time
 
 	mu           sync.Mutex
-	failingSince map[string]time.Time // botID -> start of the current failure streak (zero = reachable)
+	failingSince map[string]time.Time // botID -> last response before the current failure streak (zero = reachable)
+	lastResponse map[string]time.Time // botID -> last time Telegram answered
 	lastTransfer time.Time
 	lastAttempt  time.Time
 }
@@ -115,6 +120,7 @@ func New(cfg Config, cluster Cluster, prober PeerProber, logger *slog.Logger) *M
 		logger:       logger,
 		now:          time.Now,
 		failingSince: make(map[string]time.Time),
+		lastResponse: make(map[string]time.Time),
 	}
 }
 
@@ -123,6 +129,7 @@ func (m *Monitor) TelegramReachable(botID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.failingSince[botID] = time.Time{}
+	m.lastResponse[botID] = m.now()
 }
 
 // TelegramUnreachable implements telegram.HealthReporter.
@@ -130,7 +137,11 @@ func (m *Monitor) TelegramUnreachable(botID string, _ error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.failingSince[botID].IsZero() {
-		m.failingSince[botID] = m.now()
+		since := m.lastResponse[botID]
+		if since.IsZero() {
+			since = m.now()
+		}
+		m.failingSince[botID] = since
 	}
 }
 
@@ -139,6 +150,7 @@ func (m *Monitor) BotStopped(botID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.failingSince, botID)
+	delete(m.lastResponse, botID)
 }
 
 // Run checks every CheckInterval until ctx is done.
@@ -198,7 +210,15 @@ func (m *Monitor) Check(ctx context.Context) bool {
 		"event", "failover.node_unhealthy", "failing_bots", len(failing), "running_bots", tracked)
 
 	self := m.cluster.ID()
-	for _, peer := range m.cluster.ListNodes() {
+	nodes := m.cluster.ListNodes()
+	for _, n := range nodes {
+		if n.ID == self && n.GRPCAddr != "" && m.peerReaches(ctx, n, probed) {
+			m.logger.Info("bots failing, but this node's own check reaches telegram; keeping leadership",
+				"event", "failover.self_check_ok", "failing_bots", len(failing))
+			return false
+		}
+	}
+	for _, peer := range nodes {
 		if peer.ID == self || peer.GRPCAddr == "" || peer.RaftAddr == "" {
 			continue
 		}

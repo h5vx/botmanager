@@ -23,21 +23,31 @@ func (r *Runner) sendLoop(ctx context.Context, bot raftcluster.Bot, api *Client)
 
 	var rateLimitedUntil time.Time
 
+	// The first pass runs right away and ignores RETRYING messages'
+	// NextRetryAt: a runner starts when this node becomes leader, and that
+	// backoff usually belongs to the previous leader, often the one that
+	// lost Telegram — the message should go out now, not when the old
+	// node's backoff expires.
+	fresh := true
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		case _, ok := <-appliedCh:
-			if !ok {
+		if !fresh {
+			select {
+			case <-ctx.Done():
 				return
+			case _, ok := <-appliedCh:
+				if !ok {
+					return
+				}
+			case <-ticker.C:
 			}
-		case <-ticker.C:
 		}
 
 		if time.Now().Before(rateLimitedUntil) {
 			continue
 		}
-		if wait := r.processOutbound(ctx, bot, api); wait > 0 {
+		wait := r.processOutbound(ctx, bot, api, fresh)
+		fresh = false
+		if wait > 0 {
 			rateLimitedUntil = time.Now().Add(wait)
 		}
 		if ctx.Err() != nil {
@@ -51,8 +61,10 @@ func (r *Runner) sendLoop(ctx context.Context, bot raftcluster.Bot, api *Client)
 // (RateLimit → postpone and retry with a local send backoff —
 // deliberately NOT written to raftcluster, see package doc's reaction
 // table); sendLoop then pauses this bot's sends for that long.
-func (r *Runner) processOutbound(ctx context.Context, bot raftcluster.Bot, api *Client) time.Duration {
-	for _, msg := range r.readyMessages(bot.ID) {
+// ignoreBackoff also attempts RETRYING messages whose NextRetryAt has not
+// come yet.
+func (r *Runner) processOutbound(ctx context.Context, bot raftcluster.Bot, api *Client, ignoreBackoff bool) time.Duration {
+	for _, msg := range r.readyMessages(bot.ID, ignoreBackoff) {
 		if ctx.Err() != nil {
 			return 0
 		}
@@ -113,7 +125,7 @@ const defaultRateLimitWait = 30 * time.Second
 // readyMessages returns bot.ID's PENDING messages and RETRYING messages
 // whose NextRetryAt has elapsed, sorted critical-first
 // then oldest-created-first within a priority for fairness.
-func (r *Runner) readyMessages(botID string) []raftcluster.Message {
+func (r *Runner) readyMessages(botID string, ignoreBackoff bool) []raftcluster.Message {
 	now := time.Now()
 	var ready []raftcluster.Message
 
@@ -127,7 +139,7 @@ func (r *Runner) readyMessages(botID string) []raftcluster.Message {
 		raftcluster.ListMessagesFilter{BotID: botID, Status: raftcluster.DeliveryStatusRetrying}, 0, "")
 	if err == nil {
 		for _, m := range retrying {
-			if m.Delivery.NextRetryAt.IsZero() || !m.Delivery.NextRetryAt.After(now) {
+			if ignoreBackoff || m.Delivery.NextRetryAt.IsZero() || !m.Delivery.NextRetryAt.After(now) {
 				ready = append(ready, m)
 			}
 		}

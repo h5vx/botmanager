@@ -102,6 +102,44 @@ func TestRunner_SendsPendingMessagesAndUpdatesDelivery(t *testing.T) {
 	}
 }
 
+// TestRunner_NewRunnerSendsRetryingMessagesAtOnce: a runner starts on a
+// new leader, and the RETRYING message's backoff was set by the previous
+// leader — the first pass sends it without waiting for NextRetryAt.
+func TestRunner_NewRunnerSendsRetryingMessagesAtOnce(t *testing.T) {
+	srv := newTestServer(t, func(method string, body map[string]any) (int, map[string]any) {
+		switch method {
+		case "getUpdates":
+			return http.StatusOK, emptyGetUpdates()
+		case "sendMessage":
+			return http.StatusOK, map[string]any{
+				"ok":     true,
+				"result": map[string]any{"message_id": 7, "chat": map[string]any{"id": body["chat_id"]}, "text": body["text"]},
+			}
+		default:
+			t.Fatalf("unexpected method %q", method)
+			return 0, nil
+		}
+	})
+
+	cluster := newFakeCluster()
+	bot := raftcluster.Bot{ID: "bot-1", Token: validTestToken, State: raftcluster.BotStateEnabled}
+	cluster.addBot(bot)
+	cluster.putMessage(raftcluster.Message{
+		IdempotencyKey: "key-1", BotID: bot.ID, ChatID: 42, Text: "login",
+		Priority: raftcluster.PriorityNormal, CreatedAt: time.Now(),
+		Delivery: raftcluster.DeliveryInfo{
+			Status: raftcluster.DeliveryStatusRetrying, Retries: 5,
+			NextRetryAt: time.Now().Add(time.Hour),
+		},
+	})
+
+	startTestRunner(t, cluster, srv.URL, bot)
+
+	waitFor(t, 2*time.Second, func() bool {
+		return cluster.getMessage("key-1").Delivery.Status == raftcluster.DeliveryStatusSent
+	})
+}
+
 func TestRunner_PriorityCriticalBeforeNormal(t *testing.T) {
 	var mu sync.Mutex
 	var order []string

@@ -103,8 +103,9 @@ func (r RaftConfig) RaftTimeouts() (heartbeat, election, lease time.Duration) {
 // лидер его не видит (internal/failover).
 type FailoverConfig struct {
 	Enabled bool `yaml:"enabled"`
-	// FailureWindowSeconds — сколько бот должен не получать от Telegram
-	// вообще никакого ответа, чтобы считаться сбойным.
+	// FailureWindowSeconds — сколько бот в сбое должен не получать от
+	// Telegram вообще никакого ответа (считая от последнего ответа), чтобы
+	// считаться сбойным.
 	FailureWindowSeconds int `yaml:"failure_window_seconds"`
 	// MinFailingBots — минимум сбойных ботов (и не меньше половины
 	// работающих), чтобы считать проблемой сам узел.
@@ -373,10 +374,10 @@ func Default() Config {
 		},
 		Failover: FailoverConfig{
 			Enabled:              true,
-			FailureWindowSeconds: 60,
+			FailureWindowSeconds: 15,
 			MinFailingBots:       1,
 			CooldownSeconds:      300,
-			CheckIntervalSeconds: 10,
+			CheckIntervalSeconds: 2,
 		},
 		GRPC: GRPCConfig{ListenAddr: ":9090"},
 		HTTP: HTTPConfig{ListenAddr: ":9091"},

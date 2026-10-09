@@ -238,11 +238,13 @@ cluster, start the new node with `raft.bootstrap: false` and call
   another node first, so writes continue almost without a pause.
 - **The leader cannot reach Telegram, but a peer can** — when at least
   `failover.min_failing_bots` bots (and at least half of the running ones)
-  have had no answer from Telegram for `failover.failure_window_seconds`,
+  have had no answer from Telegram for `failover.failure_window_seconds`
+  (15 s by default) and a fresh check from the leader itself fails too,
   the leader asks its peers to check Telegram for those same bots (with
   their tokens and proxies) and hands leadership to one that succeeds.
   If nobody reaches Telegram — an outage on Telegram's side or a broken
-  proxy of one bot — leadership stays where it is.
+  proxy of one bot — leadership stays where it is. Messages the old
+  leader was retrying are sent by the new one right away.
 - **Manually** — `Maintenance.TransferLeadership`, e.g. before
   maintenance of a node.
 

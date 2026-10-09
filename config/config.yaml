@@ -52,14 +52,15 @@ raft:
 # а другой узел его видит — Raft сам такого лидера не заменит. Узел считает
 # проблемой себя, когда не меньше min_failing_bots ботов (и не меньше
 # половины работающих) не получают от Telegram никакого ответа
-# failure_window_seconds подряд. Лидерство уходит только узлу, который
-# проверил доступ к Telegram для этих же ботов (их токен и прокси).
+# failure_window_seconds подряд, а свежая проверка с самого узла тоже не
+# проходит. Лидерство уходит только узлу, который проверил доступ к
+# Telegram для этих же ботов (их токен и прокси).
 failover:
   enabled: true
-  failure_window_seconds: 60
+  failure_window_seconds: 15
   min_failing_bots: 1
   cooldown_seconds: 300
-  check_interval_seconds: 10
+  check_interval_seconds: 2
 
 grpc:
   listen_addr: ":9090"
